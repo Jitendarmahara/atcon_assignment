@@ -1,0 +1,94 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply font-sans antialiased;
+  }
+  body {
+    @apply bg-slate-50 text-slate-900;
+  }
+  ::selection {
+    @apply bg-brand-200 text-brand-950;
+  }
+}
+
+@layer components {
+  /* Buttons */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-lg text-sm font-medium
+      transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400
+      focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-md {
+    @apply px-4 py-2;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
+  }
+  .btn-primary {
+    @apply btn btn-md bg-brand-600 text-white shadow-soft hover:bg-brand-700 active:bg-brand-800;
+  }
+  .btn-secondary {
+    @apply btn btn-md border border-slate-200 bg-white text-slate-700 shadow-soft hover:border-slate-300 hover:bg-slate-50;
+  }
+  .btn-ghost {
+    @apply btn btn-md text-slate-600 hover:bg-slate-100 hover:text-slate-900;
+  }
+  .btn-danger {
+    @apply btn btn-md bg-white text-red-600 ring-1 ring-inset ring-red-200 hover:bg-red-50;
+  }
+
+  /* Surfaces */
+  .card {
+    @apply rounded-xl border border-slate-200/80 bg-white shadow-soft;
+  }
+  .card-pad {
+    @apply card p-5;
+  }
+  .card-hover {
+    @apply transition-all duration-150 hover:-translate-y-0.5 hover:border-brand-200 hover:shadow-card;
+  }
+
+  /* Forms */
+  .field-label {
+    @apply block text-sm font-medium text-slate-700;
+  }
+  .input {
+    @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-soft
+      transition-colors placeholder:text-slate-400
+      focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100;
+  }
+
+  /* Badges */
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+  .badge-slate {
+    @apply badge bg-slate-100 text-slate-600;
+  }
+  .badge-brand {
+    @apply badge bg-brand-50 text-brand-700;
+  }
+  .badge-green {
+    @apply badge bg-emerald-50 text-emerald-700;
+  }
+  .badge-amber {
+    @apply badge bg-amber-50 text-amber-700;
+  }
+  .badge-red {
+    @apply badge bg-red-50 text-red-700;
+  }
+
+  /* Misc */
+  .page-title {
+    @apply text-xl font-semibold tracking-tight text-slate-900;
+  }
+  .section-title {
+    @apply font-semibold text-slate-900;
+  }
+  .link-muted {
+    @apply text-sm text-slate-500 transition-colors hover:text-brand-600;
+  }
+}

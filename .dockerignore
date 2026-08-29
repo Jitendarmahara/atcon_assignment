@@ -1,0 +1,17 @@
+node_modules
+**/node_modules
+dist
+**/dist
+build
+.env
+.env.*
+!server/.env.example
+*.log
+.DS_Store
+storage
+coverage
+.turbo
+*.tsbuildinfo
+.git
+web
+!web/package.json

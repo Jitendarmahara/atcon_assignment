@@ -1,0 +1,26 @@
+{
+  "name": "ats-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Applicant Tracking + Candidate Pipeline System",
+  "scripts": {
+    "dev": "concurrently -n api,worker,web -c cyan,magenta,green \"pnpm --filter server dev\" \"pnpm --filter server dev:worker\" \"pnpm --filter web dev\"",
+    "dev:api": "pnpm --filter server dev",
+    "dev:worker": "pnpm --filter server dev:worker",
+    "dev:web": "pnpm --filter web dev",
+    "build": "pnpm --filter server build && pnpm --filter web build",
+    "test": "pnpm --filter server test",
+    "db:migrate": "pnpm --filter server db:migrate",
+    "db:seed": "pnpm --filter server db:seed",
+    "db:reset": "pnpm --filter server db:reset",
+    "setup": "docker compose up -d && pnpm install && pnpm db:migrate && pnpm db:seed"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=20"
+  }
+}
+

@@ -1,0 +1,460 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm]
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tenancy & Auth
+// ─────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  // Public identifier for the careers-site board, e.g. /public/orgs/acme/jobs.
+  // Distinct from `id` so the public URL doesn't leak an internal uuid and
+  // stays stable/readable even though it's derived from a mutable `name`.
+  slug      String   @unique
+  createdAt DateTime @default(now())
+
+  users          User[]
+  jobs           Job[]
+  candidates     Candidate[]
+  auditLogs      AuditLog[]
+  notifications  Notification[]
+  metricsRollups MetricsRollup[]
+  outboxEvents   OutboxEvent[]
+
+  @@map("organizations")
+}
+
+enum UserRole {
+  ADMIN
+  RECRUITER
+  HIRING_MANAGER
+  INTERVIEWER
+}
+
+model User {
+  id           String   @id @default(uuid())
+  orgId        String
+  org          Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  // Globally unique, not just per-org: POST /auth/login takes only
+  // {email, password} with no org selector, so the same email existing as a
+  // user in two different orgs would make login's user lookup ambiguous.
+  // A per-org unique constraint alone would allow that and silently
+  // authenticate into whichever org's row Postgres happened to return first.
+  email        String
+  passwordHash String
+  name         String
+  role         UserRole @default(RECRUITER)
+  // Bumped by POST /auth/logout (and available for a future "revoke all
+  // sessions" action). Every refresh token embeds the tokenVersion that was
+  // current when it was issued; refresh() rejects a token whose version no
+  // longer matches, so logging out actually invalidates the refresh token
+  // instead of just discarding it client-side.
+  tokenVersion Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  stageEventsActed   StageEvent[]      @relation("StageEventActor")
+  interviewsPanelist InterviewPanelist[]
+  scorecards         Scorecard[]
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+
+  @@unique([email])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Jobs & configurable pipeline stages
+// ─────────────────────────────────────────────────────────────────────────
+
+enum JobStatus {
+  DRAFT
+  PUBLISHED
+  CLOSED
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERNSHIP
+}
+
+model Job {
+  id             String         @id @default(uuid())
+  orgId          String
+  org            Organization   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  title          String
+  description    String
+  department     String?
+  location       String?
+  employmentType EmploymentType @default(FULL_TIME)
+  openings       Int            @default(1)
+  status         JobStatus      @default(DRAFT)
+  publicSlug     String         @unique
+  publishedAt    DateTime?
+  closedAt       DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  stages       JobStage[]
+  applications Application[]
+
+  @@index([orgId, status])
+  @@map("jobs")
+}
+
+// The kind drives state-machine semantics (terminal states, where HIRED/REJECTED
+// are reachable from); `name`/`order` are fully recruiter-configurable per job.
+enum StageKind {
+  APPLIED
+  SCREEN
+  INTERVIEW
+  OFFER
+  HIRED
+  REJECTED
+}
+
+model JobStage {
+  id      String    @id @default(uuid())
+  jobId   String
+  job     Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  name    String
+  kind    StageKind
+  order   Int
+  slaDays Int?      // used for stale-candidate detection; null = no SLA
+
+  applicationsCurrent Application[] @relation("CurrentStage")
+  stageEventsFrom     StageEvent[]  @relation("StageEventFrom")
+  stageEventsTo       StageEvent[]  @relation("StageEventTo")
+
+  @@unique([jobId, order])
+  @@map("job_stages")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Candidates & resumes
+// ─────────────────────────────────────────────────────────────────────────
+
+model Candidate {
+  id              String   @id @default(uuid())
+  orgId           String
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  fullName        String
+  email           String
+  phone           String?
+  // Deterministic match keys, computed at write time in the service layer
+  // (see domain/dedupe/normalize.ts) and indexed for fast exact-match lookups.
+  normalizedEmail String
+  phoneE164       String?
+  normalizedName  String
+  // Set when this candidate was merged away into another record by
+  // POST /candidates/:id/merge. The row (and its history) is kept rather
+  // than deleted, so old references and the audit trail stay intact -
+  // reads should treat a non-null mergedIntoId as "redirect to that id".
+  mergedIntoId    String?
+  mergedInto      Candidate?  @relation("CandidateMerge", fields: [mergedIntoId], references: [id])
+  mergedFrom      Candidate[] @relation("CandidateMerge")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  resumes      Resume[]
+  applications Application[]
+
+  duplicateLinksA DuplicateCandidateLink[] @relation("DuplicateA")
+  duplicateLinksB DuplicateCandidateLink[] @relation("DuplicateB")
+
+  @@unique([orgId, normalizedEmail])
+  @@index([orgId, phoneE164])
+  @@index([normalizedName(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("candidates")
+}
+
+enum ResumeParseStatus {
+  PENDING
+  PARSING
+  PARSED
+  FAILED
+}
+
+model Resume {
+  id            String            @id @default(uuid())
+  candidateId   String
+  candidate     Candidate         @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  storageKey    String
+  originalName  String
+  mimeType      String
+  sizeBytes     Int
+  contentHash   String            // sha256 of file bytes - cheap exact-duplicate signal
+  parseStatus   ResumeParseStatus @default(PENDING)
+  parsedProfile Json?             // structured output: skills, experience, education, etc.
+  parseError    String?
+  parserVersion String?
+  createdAt     DateTime          @default(now())
+
+  @@index([candidateId])
+  @@index([contentHash])
+  @@map("resumes")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Applications & audit trail
+// ─────────────────────────────────────────────────────────────────────────
+
+enum ApplicationStatus {
+  ACTIVE
+  HIRED
+  REJECTED
+  WITHDRAWN
+}
+
+model Application {
+  id             String            @id @default(uuid())
+  candidateId    String
+  candidate      Candidate         @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  jobId          String
+  job            Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  currentStageId String
+  currentStage   JobStage          @relation("CurrentStage", fields: [currentStageId], references: [id])
+  status         ApplicationStatus @default(ACTIVE)
+  source         String            @default("careers_site")
+  appliedAt      DateTime          @default(now())
+  closedAt       DateTime?
+
+  stageEvents StageEvent[]
+  interviews  Interview[]
+
+  @@unique([candidateId, jobId])
+  @@index([jobId, currentStageId])
+  @@index([status])
+  @@map("applications")
+}
+
+// Append-only. Every stage move (including the initial "applied" event) writes
+// one row here in the same transaction as the Application update. This table
+// is the single source of truth for the audit trail AND for all analytics -
+// there are no separately maintained metric columns to drift out of sync.
+model StageEvent {
+  id                     String      @id @default(uuid())
+  applicationId          String
+  application            Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fromStageId            String?
+  fromStage              JobStage?   @relation("StageEventFrom", fields: [fromStageId], references: [id])
+  toStageId              String
+  toStage                JobStage    @relation("StageEventTo", fields: [toStageId], references: [id])
+  actorId                String?     // null = system-initiated (e.g. the initial "applied" event)
+  actor                  User?       @relation("StageEventActor", fields: [actorId], references: [id], onDelete: SetNull)
+  reason                 String?
+  isBackwardMove         Boolean     @default(false)
+  durationInPrevStageSec Int?        // computed at write time from the previous event's createdAt
+  createdAt              DateTime    @default(now())
+
+  @@index([applicationId, createdAt])
+  @@index([toStageId])
+  @@map("stage_events")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Interviews & scorecards
+// ─────────────────────────────────────────────────────────────────────────
+
+enum InterviewMode {
+  ONSITE
+  VIDEO
+  PHONE
+}
+
+enum InterviewStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+model Interview {
+  id             String          @id @default(uuid())
+  applicationId  String
+  application    Application     @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  scheduledAt    DateTime
+  durationMin    Int             @default(45)
+  mode           InterviewMode   @default(VIDEO)
+  status         InterviewStatus @default(SCHEDULED)
+  locationOrLink String?
+  createdAt      DateTime        @default(now())
+
+  panelists  InterviewPanelist[]
+  scorecards Scorecard[]
+
+  @@index([applicationId])
+  @@index([scheduledAt])
+  @@map("interviews")
+}
+
+model InterviewPanelist {
+  interviewId String
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([interviewId, userId])
+  @@map("interview_panelists")
+}
+
+enum ScorecardOverall {
+  STRONG_YES
+  YES
+  NO
+  STRONG_NO
+}
+
+model Scorecard {
+  id          String           @id @default(uuid())
+  interviewId String
+  interview   Interview        @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  authorId    String
+  author      User             @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  overall     ScorecardOverall
+  notes       String?
+  createdAt   DateTime         @default(now())
+
+  ratings ScorecardRating[]
+
+  @@unique([interviewId, authorId])
+  @@map("scorecards")
+}
+
+model ScorecardRating {
+  id          String    @id @default(uuid())
+  scorecardId String
+  scorecard   Scorecard @relation(fields: [scorecardId], references: [id], onDelete: Cascade)
+  criterion   String
+  score       Int       // 1-4, enforced at the Zod layer
+  comment     String?
+
+  @@map("scorecard_ratings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Duplicate detection
+// ─────────────────────────────────────────────────────────────────────────
+
+enum DuplicateLinkStatus {
+  PENDING
+  CONFIRMED
+  DISMISSED
+  MERGED
+}
+
+model DuplicateCandidateLink {
+  id           String              @id @default(uuid())
+  candidateAId String
+  candidateA   Candidate           @relation("DuplicateA", fields: [candidateAId], references: [id], onDelete: Cascade)
+  candidateBId String
+  candidateB   Candidate           @relation("DuplicateB", fields: [candidateBId], references: [id], onDelete: Cascade)
+  confidence   Float               // 0.0 - 1.0, see domain/dedupe/score.ts
+  signals      Json                // which checks fired and their individual weights
+  status       DuplicateLinkStatus @default(PENDING)
+  createdAt    DateTime            @default(now())
+  resolvedAt   DateTime?
+
+  @@unique([candidateAId, candidateBId])
+  @@index([status])
+  @@map("duplicate_candidate_links")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reliability: transactional outbox, notifications, generic audit log
+// ─────────────────────────────────────────────────────────────────────────
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+}
+
+// Written inside the SAME transaction as the domain change it describes.
+// A relay process polls PENDING rows with FOR UPDATE SKIP LOCKED and enqueues
+// them to BullMQ - guaranteeing no event is lost to a Redis outage and no
+// event is emitted for a transaction that ultimately rolled back.
+model OutboxEvent {
+  id          String       @id @default(uuid())
+  // Denormalized out of `payload` (every event type carries it) so this
+  // table can be tenant-filtered and RLS-scoped like every other table,
+  // instead of being the one table with no queryable tenant identifier.
+  orgId       String
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  type        String
+  payload     Json
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  lastError   String?
+  availableAt DateTime     @default(now())
+  createdAt   DateTime     @default(now())
+
+  @@index([status, availableAt])
+  @@index([orgId])
+  @@map("outbox_events")
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  orgId     String
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  payload   Json
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+// Generic append-only log for everything that isn't a pipeline stage change
+// (merges, role changes, job publish/close, etc). Stage changes get the more
+// specific StageEvent table since they carry extra analytics-relevant fields.
+model AuditLog {
+  id        String   @id @default(uuid())
+  orgId     String
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  actorId   String?
+  actor     User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action    String
+  entityType String
+  entityId  String
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now())
+
+  @@index([orgId, entityType, entityId])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Analytics rollup (nightly job caches expensive aggregates; live SQL remains
+// correct at any time - the rollup is the scale-out path, not a requirement)
+// ─────────────────────────────────────────────────────────────────────────
+
+model MetricsRollup {
+  id        String   @id @default(uuid())
+  orgId     String
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  metric    String   // e.g. "time_to_hire", "funnel", "pipeline_health", "sources"
+  scope     String   // e.g. jobId or "org"
+  data      Json
+  computedAt DateTime @default(now())
+
+  @@unique([orgId, metric, scope])
+  @@map("metrics_rollups")
+}
