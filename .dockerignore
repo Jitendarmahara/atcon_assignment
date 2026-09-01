@@ -13,5 +13,3 @@ coverage
 .turbo
 *.tsbuildinfo
 .git
-web
-!web/package.json

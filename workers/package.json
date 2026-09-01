@@ -1,0 +1,29 @@
+{
+  "name": "workers",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:relay": "HEALTH_PORT=4001 tsx watch src/relay.ts",
+    "dev:worker:resume-parse": "HEALTH_PORT=4002 tsx watch src/resumeParse.ts",
+    "dev:worker:dedupe-scan": "HEALTH_PORT=4003 tsx watch src/dedupeScan.ts",
+    "dev:worker:notifications": "HEALTH_PORT=4004 tsx watch src/notifications.ts",
+    "dev:worker:scheduled-maintenance": "HEALTH_PORT=4005 tsx watch src/scheduledMaintenance.ts",
+    "build": "tsc -p tsconfig.json",
+    "start:relay": "HEALTH_PORT=4001 node dist/relay.js",
+    "start:worker:resume-parse": "HEALTH_PORT=4002 node dist/resumeParse.js",
+    "start:worker:dedupe-scan": "HEALTH_PORT=4003 node dist/dedupeScan.js",
+    "start:worker:notifications": "HEALTH_PORT=4004 node dist/notifications.js",
+    "start:worker:scheduled-maintenance": "HEALTH_PORT=4005 node dist/scheduledMaintenance.js",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "core": "workspace:*",
+    "bullmq": "^5.34.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

@@ -1,0 +1,274 @@
+# Production-shaped deployment for the ATS backend: two images
+# (server/Dockerfile for the API, workers/Dockerfile for the outbox relay
+# and every queue worker - they moved to their own top-level package, so
+# they get their own image), 7 possible processes total, each its own
+# service/container, each scaled and restarted independently. Compare with
+# docker-compose.yml, which only runs local dev's infra dependencies
+# (Postgres/Redis/MailHog) while the app itself runs on the host via
+# `pnpm dev` - this file is what actually deploys the backend as containers.
+#
+# `name:` below is load-bearing, not decorative: Compose defaults a
+# project's name to the current directory ("casestudy"), which is exactly
+# what docker-compose.yml also resolves to when run without -p. Two compose
+# files sharing one default project name means Compose treats them as the
+# SAME project - `up` on this file will happily recreate docker-compose.yml's
+# ats-postgres/ats-redis/ats-mailhog containers to match THIS file's service
+# definitions instead of leaving them alone, and `down` on this file will
+# tear the dev stack down right along with it. (Caught exactly this while
+# building this file - no data was lost, since `down` never touches named
+# volumes, but the dev containers had to be recreated afterward.) The `name:`
+# key below gives this file its own project namespace so the two stacks
+# genuinely cannot collide, no matter how either is invoked.
+#
+# Bring up the full stack:
+#   docker compose -f docker-compose.prod.yml --env-file server/.env up -d --build
+#
+# Each queue worker is its own service precisely so it can scale
+# independently - the real mechanism for that is Kubernetes: each worker as
+# its own Deployment with its own Horizontal Pod Autoscaler, driven by that
+# queue's actual load (BullMQ queue depth, via something like KEDA's Redis
+# scaler watching the queue's list length) plus CPU utilization as a
+# secondary signal, not the primary one - these workers are I/O-bound (an
+# LLM call, an SMTP send, a Postgres query), so a real backlog can sit at
+# near-zero CPU the whole time. scheduled-maintenance-worker is deliberately
+# excluded from any of this - it must stay pinned at exactly 1 replica,
+# never autoscaled, since a second replica risks the nightly rollup
+# double-running.
+#
+# Postgres/Redis/MailHog are included here for a fully self-contained,
+# demoable stack. A real production deployment would point DATABASE_URL /
+# REDIS_URL at managed services instead (RDS, ElastiCache, SES/SendGrid) and
+# drop these three services entirely - nothing else in this file would
+# change, which is the point of the StorageAdapter/queue-connection
+# abstractions already described in ARCHITECTURE.md.
+#
+# Known limitation, already true of the dev stack and not something this
+# file changes: the RLS-scoped Postgres role (`ats_app`) is created by
+# migration 20260829213000_row_level_security with a fixed dev-only
+# password - see that migration's own comment. Rotate it via a real secrets
+# manager before this ever runs against real data.
+
+name: ats-prod
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ats
+      POSTGRES_PASSWORD: ats
+      POSTGRES_DB: ats
+    volumes:
+      - ats-prod-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ats -d ats"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ats-prod-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Catch-all SMTP sink, same role as in docker-compose.yml - swap for a real
+  # provider (SES/SendGrid) via SMTP_HOST/SMTP_PORT for an actual deployment.
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+
+  # One-shot: applies pending migrations (including creating the ats_app RLS
+  # role) and exits. Every long-running service waits on this completing
+  # successfully before it starts, so a container never boots against a
+  # schema it doesn't match.
+  migrate:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    command: ["npx", "prisma", "migrate", "deploy"]
+    working_dir: /app/packages/core
+    environment: &app-env
+      NODE_ENV: production
+      DATABASE_URL: postgresql://ats:ats@postgres:5432/ats?schema=public
+      SCOPED_DATABASE_URL: postgresql://ats_app:ats_app_password_dev_only@postgres:5432/ats?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set a real secret in server/.env}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set a real secret in server/.env}
+      JWT_ACCESS_TTL: 15m
+      JWT_REFRESH_TTL: 7d
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_FROM: "ATS Platform <no-reply@ats.local>"
+      STORAGE_DIR: /app/storage/resumes
+      MAX_UPLOAD_MB: 10
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:5173}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # One-shot, runs as root (the only service that does): a fresh named
+  # volume is created root-owned, but the app containers run as the
+  # non-root `node` user (uid 1000 - see server/Dockerfile), so without
+  # this the very first resume upload fails with EACCES. Caught exactly
+  # this failure mode while testing this file end-to-end.
+  init-storage:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    user: root
+    entrypoint: ["sh", "-c", "mkdir -p /app/storage/resumes && chown -R 1000:1000 /app/storage/resumes"]
+    volumes:
+      - ats-prod-resumes:/app/storage/resumes
+
+  api:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment: *app-env
+    volumes:
+      - ats-prod-resumes:/app/storage/resumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      init-storage:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Not tied to any one queue - dispatch() can enqueue onto any of the 4, so
+  # this doesn't belong inside one of the queue workers below. See
+  # ARCHITECTURE.md's "System overview".
+  relay:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["node", "workers/dist/relay.js"]
+    restart: unless-stopped
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # 1 replica today - no real load to justify more. Most likely candidate to
+  # scale first if that changes: resume parsing calls out to an LLM
+  # (DeepSeek/Claude), which is the one external, latency-unpredictable
+  # dependency among the 4 queues. In Kubernetes this is a Deployment with
+  # its own HPA, scaled primarily on this queue's depth (see the file header
+  # comment) since LLM latency shows up as backlog, not CPU.
+  resume-parse-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["node", "workers/dist/resumeParse.js"]
+    restart: unless-stopped
+    environment: *app-env
+    volumes:
+      - ats-prod-resumes:/app/storage/resumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      init-storage:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  # 1 replica: human-triggered (a recruiter clicking "rescan"), local
+  # Postgres work only, inherently low volume. Deliberately its own service,
+  # not merged with resume-parse-worker - different bottleneck, see
+  # packages/core/src/queues/definitions.ts.
+  dedupe-scan-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["node", "workers/dist/dedupeScan.js"]
+    restart: unless-stopped
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # 1 replica today. Handles every outbound email plus the delayed interview
+  # reminder - fast, SMTP-bound, no external LLM - so scale this one if
+  # notification volume ever outgrows a single worker, independently of
+  # resume-parse-worker.
+  notifications-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["node", "workers/dist/notifications.js"]
+    restart: unless-stopped
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Exactly 1 replica, always - never scale this one. The nightly rollup
+  # must not overlap itself; running a second replica would just risk two
+  # copies racing on the same night's run for no benefit.
+  scheduled-maintenance-worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: ["node", "workers/dist/scheduledMaintenance.js"]
+    restart: unless-stopped
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Static build served by nginx, which also reverse-proxies /api/v1/... to
+  # `api` on the same origin - see web/nginx.conf. Port 5173 to match
+  # WEB_ORIGIN's default above (and everything the dev setup already uses),
+  # not because nginx cares what port it's mapped to.
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  ats-prod-pgdata:
+  ats-prod-redisdata:
+  # Shared between api (writes on upload) and resume-parse-worker (reads to
+  # extract text) - local-disk StorageAdapter needs a filesystem both
+  # containers actually share. A real deployment swaps StorageAdapter for
+  # the S3/GCS implementation instead (see ARCHITECTURE.md's "Scalability
+  # considerations") and this volume goes away entirely.
+  ats-prod-resumes:

@@ -4,16 +4,16 @@
   "private": true,
   "description": "Applicant Tracking + Candidate Pipeline System",
   "scripts": {
-    "dev": "concurrently -n api,worker,web -c cyan,magenta,green \"pnpm --filter server dev\" \"pnpm --filter server dev:worker\" \"pnpm --filter web dev\"",
-    "dev:api": "pnpm --filter server dev",
-    "dev:worker": "pnpm --filter server dev:worker",
+    "dev": "pnpm --filter core build && concurrently -n core,api,relay,resume-parse,dedupe-scan,notifications,sched-maint,web -c red,cyan,magenta,yellow,green,blue,white,gray \"pnpm --filter core build:watch\" \"pnpm --filter server dev\" \"pnpm --filter workers dev:relay\" \"pnpm --filter workers dev:worker:resume-parse\" \"pnpm --filter workers dev:worker:dedupe-scan\" \"pnpm --filter workers dev:worker:notifications\" \"pnpm --filter workers dev:worker:scheduled-maintenance\" \"pnpm --filter web dev\"",
+    "dev:api": "pnpm --filter core build && pnpm --filter server dev",
+    "dev:workers": "pnpm --filter core build && concurrently -n core,relay,resume-parse,dedupe-scan,notifications,sched-maint -c red,magenta,yellow,green,blue,white \"pnpm --filter core build:watch\" \"pnpm --filter workers dev:relay\" \"pnpm --filter workers dev:worker:resume-parse\" \"pnpm --filter workers dev:worker:dedupe-scan\" \"pnpm --filter workers dev:worker:notifications\" \"pnpm --filter workers dev:worker:scheduled-maintenance\"",
     "dev:web": "pnpm --filter web dev",
-    "build": "pnpm --filter server build && pnpm --filter web build",
+    "build": "pnpm --filter core build && pnpm --filter server build && pnpm --filter workers build && pnpm --filter web build",
     "test": "pnpm --filter server test",
-    "db:migrate": "pnpm --filter server db:migrate",
-    "db:seed": "pnpm --filter server db:seed",
-    "db:reset": "pnpm --filter server db:reset",
-    "setup": "docker compose up -d && pnpm install && pnpm db:migrate && pnpm db:seed"
+    "db:migrate": "pnpm --filter core db:migrate",
+    "db:seed": "pnpm --filter core db:seed",
+    "db:reset": "pnpm --filter core db:reset",
+    "setup": "docker compose up -d && pnpm install && pnpm --filter core build && pnpm db:migrate && pnpm db:seed"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
@@ -23,4 +23,3 @@
     "node": ">=20"
   }
 }
-
