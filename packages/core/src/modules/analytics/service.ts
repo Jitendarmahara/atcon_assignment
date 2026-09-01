@@ -67,19 +67,73 @@ export async function funnel(orgId: string, jobId: string) {
   });
 }
 
+// Canonical display order/labels for the org-wide (no jobId) pipeline health
+// view - every job's stages get grouped into these 6 buckets by kind rather
+// than listed one row per (job, stage). See the comment on byStage below for
+// why that grouping is necessary, not just tidier.
+const STAGE_KIND_ORDER = ["APPLIED", "SCREEN", "INTERVIEW", "OFFER", "HIRED", "REJECTED"] as const;
+const STAGE_KIND_LABELS: Record<string, string> = {
+  APPLIED: "Applied",
+  SCREEN: "Screening",
+  INTERVIEW: "Interview",
+  OFFER: "Offer",
+  HIRED: "Hired",
+  REJECTED: "Rejected",
+};
+
 export async function pipelineHealth(orgId: string, jobId?: string) {
-  const jobFilter = jobId ? Prisma.sql`AND js."jobId" = ${jobId}` : Prisma.empty;
+  // Scoped to one job: every stage row is already distinct and meaningful on
+  // its own (a job's own pipeline never repeats a stage), so the original
+  // per-stage detail is exactly right here - kept as-is.
+  //
+  // Org-wide (no jobId, the only way the dashboard actually calls this):
+  // every job has its own JobStage rows even when they share a name ("Applied"
+  // exists once per job) - grouping by individual stage id, the previous
+  // behavior, produced one row per (job, stage) combination: four jobs with a
+  // stage kind=APPLIED each produced four separate "Applied" rows, most of
+  // them zero, with no job label to tell them apart. Not a rendering bug,
+  // the query itself was returning the wrong shape of data for a summary
+  // widget. Grouping by kind instead collapses that into the 6 buckets a
+  // pipeline overview actually means ("how many active applications are
+  // roughly at the Interview stage, across the whole org").
+  if (!jobId) {
+    const byKind = await prisma.$queryRaw<Array<{ kind: string; activeCount: bigint }>>`
+      SELECT js.kind, COUNT(a.id) AS "activeCount"
+      FROM job_stages js
+      JOIN jobs j ON j.id = js."jobId"
+      LEFT JOIN applications a ON a."currentStageId" = js.id AND a.status = 'ACTIVE'
+      WHERE j."orgId" = ${orgId}
+      GROUP BY js.kind
+    `;
+    const byKindMap = new Map(byKind.map((r) => [r.kind, Number(r.activeCount)]));
+    const byStage = STAGE_KIND_ORDER.filter((kind) => byKindMap.has(kind)).map((kind, order) => ({
+      stageId: kind,
+      name: STAGE_KIND_LABELS[kind] ?? kind,
+      kind,
+      order,
+      activeCount: byKindMap.get(kind)!,
+    }));
+
+    return { byStage, staleCandidates: await staleCandidatesFor(orgId) };
+  }
 
   const byStage = await prisma.$queryRaw<Array<{ id: string; name: string; kind: string; order: number; activeCount: bigint }>>`
     SELECT js.id, js.name, js.kind, js.order, COUNT(a.id) AS "activeCount"
     FROM job_stages js
     JOIN jobs j ON j.id = js."jobId"
     LEFT JOIN applications a ON a."currentStageId" = js.id AND a.status = 'ACTIVE'
-    WHERE j."orgId" = ${orgId} ${jobFilter}
+    WHERE j."orgId" = ${orgId} AND js."jobId" = ${jobId}
     GROUP BY js.id, js.name, js.kind, js.order
     ORDER BY js.order
   `;
 
+  return {
+    byStage: byStage.map((r) => ({ stageId: r.id, name: r.name, kind: r.kind, order: r.order, activeCount: Number(r.activeCount) })),
+    staleCandidates: await staleCandidatesFor(orgId, jobId),
+  };
+}
+
+async function staleCandidatesFor(orgId: string, jobId?: string) {
   const stale = await prisma.$queryRaw<
     Array<{ applicationId: string; candidateName: string; jobTitle: string; stageName: string; slaDays: number; daysInStage: number }>
   >`
@@ -98,11 +152,7 @@ export async function pipelineHealth(orgId: string, jobId?: string) {
       AND EXTRACT(EPOCH FROM (now() - se."createdAt")) / 86400.0 > js."slaDays"
     ORDER BY "daysInStage" DESC
   `;
-
-  return {
-    byStage: byStage.map((r) => ({ stageId: r.id, name: r.name, kind: r.kind, order: r.order, activeCount: Number(r.activeCount) })),
-    staleCandidates: stale.map((r) => ({ ...r, daysInStage: Math.round(r.daysInStage * 10) / 10 })),
-  };
+  return stale.map((r) => ({ ...r, daysInStage: Math.round(r.daysInStage * 10) / 10 }));
 }
 
 export async function sourceEffectiveness(orgId: string) {

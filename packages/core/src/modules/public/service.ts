@@ -1,9 +1,18 @@
 import { prisma } from "../../lib/prisma.js";
 import { ApiError } from "../../lib/errors.js";
 import { createOrGetCandidate } from "../candidates/service.js";
-import { addResume } from "../candidates/service.js";
+import { addResume, type UploadedFile } from "../candidates/service.js";
 import { createApplication } from "../applications/service.js";
-import type { ApplyInput } from "./schema.js";
+
+// Structurally matches the Zod-inferred type of the same name in
+// server/src/modules/public/schema.ts, which owns runtime validation at the
+// HTTP boundary - core declares its own shape independently so it has no
+// dependency on server's HTTP layer.
+interface ApplyInput {
+  fullName: string;
+  email: string;
+  phone?: string;
+}
 
 async function findPublishedJob(orgSlug: string, jobSlug: string) {
   const org = await prisma.organization.findUnique({ where: { slug: orgSlug } });
@@ -50,7 +59,7 @@ export async function getPublishedJob(orgSlug: string, jobSlug: string) {
 // tradeoff in ASSUMPTIONS.md: a fully atomic three-table cross-module
 // transaction was judged not worth the coupling it would introduce between
 // candidates/applications/resume-storage for a case-study-scale system.
-export async function apply(orgSlug: string, jobSlug: string, input: ApplyInput, file: Express.Multer.File | undefined) {
+export async function apply(orgSlug: string, jobSlug: string, input: ApplyInput, file: UploadedFile | undefined) {
   const { org, job } = await findPublishedJob(orgSlug, jobSlug);
 
   const candidate = await createOrGetCandidate(org.id, input);

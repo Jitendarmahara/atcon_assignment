@@ -6,9 +6,34 @@ import { storage } from "../../lib/storage.js";
 import { normalizeEmail, normalizeName, normalizePhone } from "../../domain/dedupe/normalize.js";
 import { scanExactMatchesForCandidate } from "../../domain/dedupe/scan.js";
 import { writeOutboxEvent } from "../../events/outbox.js";
+import { dispatchNowBestEffort } from "../../events/relay.js";
 import { EVENT_TYPES } from "../../events/types.js";
 import { dedupeScanQueue } from "../../queues/definitions.js";
-import type { CreateCandidateInput, UpdateCandidateInput } from "./schema.js";
+
+// The 4 fields this module actually reads off a multipart upload -
+// deliberately not Express.Multer.File itself, so core has no dependency on
+// the multer package (an HTTP-layer, server-only concern). server's
+// controller.ts passes req.file straight through; structurally it has every
+// field this interface asks for, so no cast is needed at that call site.
+export interface UploadedFile {
+  buffer: Buffer;
+  originalname: string;
+  mimetype: string;
+  size: number;
+}
+
+// Structurally match the Zod-inferred types of the same names in
+// server/src/modules/candidates/schema.ts - see public/service.ts for why
+// these are redeclared here rather than imported across the package boundary.
+interface CreateCandidateInput {
+  fullName: string;
+  email: string;
+  phone?: string;
+}
+interface UpdateCandidateInput {
+  fullName?: string;
+  phone?: string;
+}
 
 // Follows Candidate.mergedIntoId to the live, canonical record. A candidate
 // matched by email/phone/etc. may itself have already been merged away into
@@ -137,10 +162,10 @@ export async function rescanDuplicates(orgId: string, candidateId: string) {
   await dedupeScanQueue.add("rescan", { orgId, candidateId });
 }
 
-export async function addResume(orgId: string, candidateId: string, file: Express.Multer.File) {
+export async function addResume(orgId: string, candidateId: string, file: UploadedFile) {
   await findOwnedCandidate(orgId, candidateId);
 
-  const resume = await prisma.$transaction(async (tx) => {
+  const { created, outboxRow } = await prisma.$transaction(async (tx) => {
     const { storageKey, contentHash } = await storage.save(file.buffer, file.originalname);
     const created = await tx.resume.create({
       data: {
@@ -152,11 +177,16 @@ export async function addResume(orgId: string, candidateId: string, file: Expres
         contentHash,
       },
     });
-    await writeOutboxEvent(tx, EVENT_TYPES.RESUME_UPLOADED, { resumeId: created.id, candidateId, orgId });
-    return created;
+    const outboxRow = await writeOutboxEvent(tx, EVENT_TYPES.RESUME_UPLOADED, { resumeId: created.id, candidateId, orgId });
+    return { created, outboxRow };
   });
 
-  return resume;
+  // Fast path, not awaited - see applications/service.ts's createApplication()
+  // for the reasoning. This is what starts resume parsing, so an upload
+  // reacts immediately instead of waiting on the poll backstop.
+  dispatchNowBestEffort(outboxRow);
+
+  return created;
 }
 
 // Best-effort merge: reassigns resumes and non-conflicting applications from

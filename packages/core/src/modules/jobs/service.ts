@@ -3,13 +3,43 @@ import { ApiError } from "../../lib/errors.js";
 import { toPage } from "../../lib/pagination.js";
 import { slugify } from "../../lib/slug.js";
 import { DEFAULT_PIPELINE_TEMPLATE } from "../../domain/pipeline/template.js";
-import type {
-  CreateJobInput,
-  CreateStageInput,
-  ReorderStagesInput,
-  UpdateJobInput,
-  UpdateStageInput,
-} from "./schema.js";
+
+type EmploymentType = "FULL_TIME" | "PART_TIME" | "CONTRACT" | "INTERNSHIP";
+type StageKind = "APPLIED" | "SCREEN" | "INTERVIEW" | "OFFER" | "HIRED" | "REJECTED";
+
+// Structurally match the Zod-inferred types of the same names in
+// server/src/modules/jobs/schema.ts - see public/service.ts for why these
+// are redeclared here rather than imported across the package boundary.
+interface CreateJobInput {
+  title: string;
+  description: string;
+  department?: string;
+  location?: string;
+  employmentType: EmploymentType;
+  openings: number;
+}
+interface UpdateJobInput {
+  title?: string;
+  description?: string;
+  department?: string;
+  location?: string;
+  employmentType?: EmploymentType;
+  openings?: number;
+}
+interface CreateStageInput {
+  name: string;
+  kind: StageKind;
+  order: number;
+  slaDays?: number | null;
+}
+interface UpdateStageInput {
+  name?: string;
+  kind?: StageKind;
+  slaDays?: number | null;
+}
+interface ReorderStagesInput {
+  order: string[];
+}
 
 // Every query below is scoped by orgId - callers never pass a client-supplied
 // orgId, it always comes from the authenticated req.auth context. This is

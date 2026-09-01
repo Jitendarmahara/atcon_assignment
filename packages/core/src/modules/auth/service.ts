@@ -3,7 +3,26 @@ import { prisma } from "../../lib/prisma.js";
 import { ApiError } from "../../lib/errors.js";
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../../lib/jwt.js";
 import { slugify } from "../../lib/slug.js";
-import type { InviteUserInput, LoginInput, RegisterInput } from "./schema.js";
+
+// Structurally match the Zod-inferred types of the same names in
+// server/src/modules/auth/schema.ts - see public/service.ts for why these
+// are redeclared here rather than imported across the package boundary.
+interface RegisterInput {
+  orgName: string;
+  name: string;
+  email: string;
+  password: string;
+}
+interface LoginInput {
+  email: string;
+  password: string;
+}
+interface InviteUserInput {
+  name: string;
+  email: string;
+  password: string;
+  role: "ADMIN" | "RECRUITER" | "HIRING_MANAGER" | "INTERVIEWER";
+}
 
 const BCRYPT_ROUNDS = 10;
 

@@ -3,9 +3,22 @@ import { ApiError } from "../../lib/errors.js";
 import { toPage } from "../../lib/pagination.js";
 import { validateTransition } from "../../domain/pipeline/transitions.js";
 import { writeOutboxEvent } from "../../events/outbox.js";
+import { dispatchNowBestEffort } from "../../events/relay.js";
 import { EVENT_TYPES } from "../../events/types.js";
 import { publishOrgEvent } from "../../lib/pubsub.js";
-import type { CreateApplicationInput, TransitionApplicationInput } from "./schema.js";
+
+// Structurally match the Zod-inferred types of the same names in
+// server/src/modules/applications/schema.ts - see public/service.ts for why
+// these are redeclared here rather than imported across the package boundary.
+interface CreateApplicationInput {
+  candidateId: string;
+  jobId: string;
+  source: string;
+}
+interface TransitionApplicationInput {
+  toStageId: string;
+  reason?: string;
+}
 
 // Verifies both the job and candidate belong to the caller's org before any
 // write - the two most common tenant-isolation mistakes are trusting a
@@ -56,25 +69,31 @@ export async function createApplication(orgId: string, input: CreateApplicationI
       },
     });
 
-    await writeOutboxEvent(tx, EVENT_TYPES.APPLICATION_SUBMITTED, {
+    const outboxRow = await writeOutboxEvent(tx, EVENT_TYPES.APPLICATION_SUBMITTED, {
       applicationId: created.id,
       candidateId: candidate.id,
       jobId: job.id,
       orgId,
     });
 
-    return created;
+    return { created, outboxRow };
   });
+
+  // Fast path, not awaited: try to dispatch this event immediately instead
+  // of waiting for the relay's next poll tick. Safe to fire-and-forget - see
+  // dispatchNowBestEffort()'s own comment for why a failure here is never a
+  // problem (the poll tick is still the correctness backstop).
+  dispatchNowBestEffort(application.outboxRow);
 
   // Live-update the kanban board for anyone with this job open - a broadcast
   // (no userId), since any org member viewing this job's board should see
   // the new "Applied" card without a manual refresh.
   await publishOrgEvent(orgId, {
     type: "application.created",
-    payload: { applicationId: application.id, jobId: job.id, stageId: firstStage.id },
+    payload: { applicationId: application.created.id, jobId: job.id, stageId: firstStage.id },
   });
 
-  return application;
+  return application.created;
 }
 
 export async function listApplications(
@@ -180,7 +199,7 @@ export async function transitionApplication(
       include: { fromStage: true, toStage: true },
     });
 
-    await writeOutboxEvent(tx, EVENT_TYPES.APPLICATION_STAGE_CHANGED, {
+    const outboxRow = await writeOutboxEvent(tx, EVENT_TYPES.APPLICATION_STAGE_CHANGED, {
       applicationId,
       orgId,
       fromStageId: application.currentStageId,
@@ -189,13 +208,20 @@ export async function transitionApplication(
       actorId,
     });
 
-    return { application: await tx.application.findUniqueOrThrow({ where: { id: applicationId } }), stageEvent };
+    return {
+      application: await tx.application.findUniqueOrThrow({ where: { id: applicationId } }),
+      stageEvent,
+      outboxRow,
+    };
   });
+
+  // Fast path, not awaited - see createApplication() above for the reasoning.
+  dispatchNowBestEffort(result.outboxRow);
 
   await publishOrgEvent(orgId, {
     type: "application.stage_changed",
     payload: { applicationId, jobId: application.jobId, fromStageId, toStageId: toStage.id },
   });
 
-  return result;
+  return { application: result.application, stageEvent: result.stageEvent };
 }
