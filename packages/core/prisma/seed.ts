@@ -142,13 +142,17 @@ async function seedOrg(orgName: string, jobTitles: string[]) {
           sizeBytes: randomInt(15_000, 60_000),
           contentHash,
           parseStatus: "PARSED",
-          parserVersion: "heuristic@1",
+          // Matches what the real pipeline actually produces now - resume
+          // parsing is LLM-only (see domain/resume/index.ts), so seed data
+          // simulating a parsed resume should look like a real one.
+          parserVersion: "deepseek-chat@1",
           parsedProfile: {
             name: fullName,
             email,
             phone,
             skills: [pick(["TypeScript", "Python", "Go"]), pick(["React", "Vue", "Angular"]), pick(["PostgreSQL", "MySQL", "MongoDB"])],
             experience: [{ employer: pick(EMPLOYERS), title: pick(["Engineer", "Senior Engineer", "Lead Engineer"]), description: "Relevant prior experience." }],
+            projects: [],
             education: [{ school: pick(SCHOOLS), degree: "B.S. Computer Science" }],
           },
         },

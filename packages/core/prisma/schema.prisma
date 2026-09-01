@@ -458,3 +458,59 @@ model MetricsRollup {
   @@unique([orgId, metric, scope])
   @@map("metrics_rollups")
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Candidate-facing portal: a real login, not a per-org one. Deliberately NOT
+// org-scoped, unlike User - the same person can apply to multiple orgs'
+// public job boards with the same email and should see every application
+// from one account. Matched to Candidate rows (which ARE per-org, one per
+// org a person applied to) by normalized email at read time
+// (modules/candidatePortal/service.ts), the same signal domain/dedupe/
+// normalize.ts already computes - deliberately no FK, since a
+// CandidateAccount can be registered before, after, or with no matching
+// Candidate row at all. No Postgres Row-Level Security here either: RLS
+// scopes tenant (org) data, and this table has no orgId to scope by - it's
+// protected the same way Organization/User registration already is before
+// any org context exists, by requiring the right credentials at the API
+// layer (modules/candidateAuth/).
+// ─────────────────────────────────────────────────────────────────────────
+
+model CandidateAccount {
+  id              String   @id @default(uuid())
+  email           String   @unique
+  normalizedEmail String   @unique
+  fullName        String
+  passwordHash    String
+  // Same purpose as User.tokenVersion: bumped on logout and on a successful
+  // password reset, immediately invalidating every outstanding refresh token.
+  tokenVersion    Int      @default(0)
+  createdAt       DateTime @default(now())
+  // The candidate-portal equivalent of Notification.readAt, but a single
+  // watermark rather than one row per event: the "update feed" isn't a
+  // separate notification table (see modules/candidatePortal/service.ts's
+  // comment on why), so "unread" is computed as "StageEvents across all of
+  // my applications newer than this timestamp" instead of a per-row read
+  // flag. Null means "never viewed" - every update counts as unread.
+  // Server-side (not localStorage) so it's consistent across devices.
+  notificationsViewedAt DateTime?
+
+  passwordResetTokens PasswordResetToken[]
+
+  @@map("candidate_accounts")
+}
+
+model PasswordResetToken {
+  id                 String           @id @default(uuid())
+  candidateAccountId String
+  candidateAccount   CandidateAccount @relation(fields: [candidateAccountId], references: [id], onDelete: Cascade)
+  // sha256 of the actual token, never the raw value - same reasoning as
+  // never storing a plaintext password. The raw token only ever exists in
+  // the one email it's sent in and the one request that redeems it.
+  tokenHash          String           @unique
+  expiresAt          DateTime
+  usedAt             DateTime?
+  createdAt          DateTime         @default(now())
+
+  @@index([candidateAccountId])
+  @@map("password_reset_tokens")
+}
