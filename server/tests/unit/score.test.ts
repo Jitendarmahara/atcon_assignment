@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { AUTO_LINK_THRESHOLD, REVIEW_THRESHOLD, scoreDuplicate } from "../../src/domain/dedupe/score.js";
+import { AUTO_LINK_THRESHOLD, REVIEW_THRESHOLD, scoreDuplicate } from "core/domain/dedupe/score.js";
 
 const base = { emailMatch: false, phoneMatch: false, resumeContentHashMatch: false, nameSimilarity: 0, sharedEmployerOrSchool: false };
 

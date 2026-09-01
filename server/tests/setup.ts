@@ -1,13 +1,13 @@
 import { beforeEach, afterAll } from "vitest";
-import { prisma, disconnectPrisma } from "../src/lib/prisma.js";
-import { redis } from "../src/lib/redis.js";
-import { closePubSub } from "../src/lib/pubsub.js";
+import { prisma, disconnectPrisma } from "core/lib/prisma.js";
+import { redis } from "core/lib/redis.js";
+import { closePubSub } from "core/lib/pubsub.js";
 
 const TABLES = [
   "scorecard_ratings", "scorecards", "interview_panelists", "interviews",
   "stage_events", "applications", "duplicate_candidate_links", "resumes", "candidates",
   "job_stages", "jobs", "notifications", "audit_logs", "outbox_events", "metrics_rollups",
-  "users", "organizations",
+  "users", "organizations", "password_reset_tokens", "candidate_accounts",
 ];
 
 async function truncateAll() {

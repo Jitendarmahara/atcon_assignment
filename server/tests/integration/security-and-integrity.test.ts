@@ -1,13 +1,14 @@
 import { describe, it, expect } from "vitest";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
-import { prisma } from "../../src/lib/prisma.js";
-import { dedupeScanQueue } from "../../src/queues/definitions.js";
-import { relayOnce } from "../../src/events/relay.js";
-import { EVENT_TYPES } from "../../src/events/types.js";
-import { subscribeOrgEvents } from "../../src/lib/pubsub.js";
-import { notifyOrgRecruiters } from "../../src/lib/notify.js";
-import { prisma as scopedAwarePrisma, runWithOrgScope } from "../../src/lib/prisma.js";
+import { prisma } from "core/lib/prisma.js";
+import { dedupeScanQueue } from "core/queues/definitions.js";
+import { relayOnce } from "core/events/relay.js";
+import { EVENT_TYPES } from "core/events/types.js";
+import { subscribeOrgEvents } from "core/lib/pubsub.js";
+import { notifyOrgRecruiters } from "core/lib/notify.js";
+import { prisma as scopedAwarePrisma, runWithOrgScope } from "core/lib/prisma.js";
+import { scanFullDuplicatesForCandidate } from "core/domain/dedupe/scan.js";
 
 const app = createApp();
 
@@ -388,6 +389,61 @@ describe("no credential leakage via joined User relations", () => {
   });
 });
 
+// Regression coverage for a real bug found live (not just by reading the
+// code): scanFullDuplicatesForCandidate() calls scoreDuplicate() up to three
+// separate times per candidate pair - once for the exact-match pass, once for
+// the resume content-hash pass, once per fuzzy-name-similarity match - each
+// producing an independent confidence/signals pair from a single signal.
+// upsertLink()'s Prisma `update` clause used to overwrite confidence/signals
+// unconditionally on every call, so whichever pass ran last always won, even
+// when it was weaker - a real pair sharing an identical resume (0.85,
+// resume_content_hash) AND a similar name (e.g. 0.65, name_similarity) ended
+// up persisted at 0.65 with the resume-hash signal silently discarded, since
+// the fuzzy-name pass always runs last. This directly contradicted
+// ARCHITECTURE.md's documented invariant ("the score is the max of whichever
+// signals fired, not a sum"), which score.ts's scoreDuplicate() only
+// guarantees *within* a single call. Fixed by having upsertLink() read the
+// existing row, keep max(existing.confidence, new), and merge signals by name
+// instead of overwriting.
+describe("duplicate scoring persistence", () => {
+  it("keeps the strongest signal's confidence even when a weaker signal is scored afterward for the same pair", async () => {
+    const { token, orgSlug } = await registerOrg("Signal Merge Org", "owner@signal-merge.example");
+    const auth = { Authorization: `Bearer ${token}` };
+    const org = await prisma.organization.findUniqueOrThrow({ where: { slug: orgSlug } });
+
+    const a = await request(app)
+      .post("/api/v1/candidates")
+      .set(auth)
+      .send({ fullName: "Zephyr Quantum", email: "zephyr-a@signal-merge.example" });
+    const b = await request(app)
+      .post("/api/v1/candidates")
+      .set(auth)
+      .send({ fullName: "Zephyr Quantumm", email: "zephyr-b@signal-merge.example" }); // similar name, matches trigram threshold
+
+    // Give both candidates a resume with the identical content hash - the
+    // strong (0.85) signal that must survive the weaker fuzzy-name pass below.
+    const sameHash = "identical-resume-content-hash-for-test";
+    await prisma.resume.create({
+      data: { candidateId: a.body.id, storageKey: "test/a.pdf", originalName: "a.pdf", mimeType: "application/pdf", sizeBytes: 100, contentHash: sameHash, parseStatus: "PARSED" },
+    });
+    await prisma.resume.create({
+      data: { candidateId: b.body.id, storageKey: "test/b.pdf", originalName: "b.pdf", mimeType: "application/pdf", sizeBytes: 100, contentHash: sameHash, parseStatus: "PARSED" },
+    });
+
+    await scanFullDuplicatesForCandidate(org.id, a.body.id);
+
+    const [candA, candB] = [a.body.id, b.body.id].sort();
+    const link = await prisma.duplicateCandidateLink.findUniqueOrThrow({
+      where: { candidateAId_candidateBId: { candidateAId: candA, candidateBId: candB } },
+    });
+
+    expect(link.confidence).toBeGreaterThanOrEqual(0.85);
+    const signalNames = (link.signals as Array<{ name: string }>).map((s) => s.name);
+    expect(signalNames).toContain("resume_content_hash");
+    expect(signalNames).toContain("name_similarity");
+  });
+});
+
 // Regression coverage for a real gap this review found: the `dedupe-scan`
 // BullMQ queue and its processor (queues/processors/dedupeScan.ts) were
 // registered as a worker but nothing ever called `dedupeScanQueue.add()` -
@@ -744,6 +800,58 @@ describe("realtime events (pub/sub)", () => {
     const payload = await eventPromise;
     expect(payload.userId).toBe(admin.id);
   });
+
+  // Regression coverage for a real bug found live: scheduling/cancelling an
+  // interview, or completing one via a scorecard, published nothing on the
+  // realtime channel at all - unlike every other write path in this app,
+  // which all publish here. Combined with web/src/pages/Interviews.tsx
+  // having no refetchInterval either, the Interviews page had zero update
+  // mechanism (no push, no poll) - not slow, genuinely static until a
+  // manual navigation away and back.
+  it("publishes interview.scheduled when an interview is scheduled", async () => {
+    const { token, orgSlug } = await registerOrg("Realtime Interview Org", "owner@realtime-interview.example");
+    const auth = { Authorization: `Bearer ${token}` };
+    const orgId = await orgIdFor(orgSlug);
+    const { jobId } = await createPublishedJob(auth, "Realtime Interview Role");
+    const candidate = await request(app)
+      .post("/api/v1/candidates")
+      .set(auth)
+      .send({ fullName: "Realtime Interview Candidate", email: "realtime-interview-candidate@realtime-interview.example" });
+    const application = await request(app).post("/api/v1/applications").set(auth).send({ candidateId: candidate.body.id, jobId });
+
+    const eventPromise = waitForOrgEvent(orgId, "interview.scheduled");
+    const interview = await request(app)
+      .post("/api/v1/interviews")
+      .set(auth)
+      .send({ applicationId: application.body.id, scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), panelistUserIds: [] });
+    expect(interview.status).toBe(201);
+
+    const payload = await eventPromise;
+    expect(payload).toMatchObject({ interviewId: interview.body.id, applicationId: application.body.id });
+  });
+
+  it("publishes interview.updated when an interview is cancelled", async () => {
+    const { token, orgSlug } = await registerOrg("Realtime Interview Cancel Org", "owner@realtime-interview-cancel.example");
+    const auth = { Authorization: `Bearer ${token}` };
+    const orgId = await orgIdFor(orgSlug);
+    const { jobId } = await createPublishedJob(auth, "Realtime Interview Cancel Role");
+    const candidate = await request(app)
+      .post("/api/v1/candidates")
+      .set(auth)
+      .send({ fullName: "Realtime Cancel Candidate", email: "realtime-cancel-candidate@realtime-interview-cancel.example" });
+    const application = await request(app).post("/api/v1/applications").set(auth).send({ candidateId: candidate.body.id, jobId });
+    const interview = await request(app)
+      .post("/api/v1/interviews")
+      .set(auth)
+      .send({ applicationId: application.body.id, scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), panelistUserIds: [] });
+
+    const eventPromise = waitForOrgEvent(orgId, "interview.updated");
+    const cancel = await request(app).post(`/api/v1/interviews/${interview.body.id}/cancel`).set(auth);
+    expect(cancel.status).toBe(200);
+
+    const payload = await eventPromise;
+    expect(payload).toMatchObject({ interviewId: interview.body.id });
+  });
 });
 
 describe("outbox relay crash recovery", () => {
@@ -786,5 +894,177 @@ describe("outbox relay crash recovery", () => {
 
     const after = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: leased.id } });
     expect(after.status).toBe("PROCESSING");
+  });
+});
+
+// The relay's poll interval was slowed from 1s to 5 minutes once it became a
+// backstop rather than the primary dispatch path - dispatchNowBestEffort()
+// (events/relay.ts), called directly from the write path right after each
+// transaction that writes an outbox row commits, is what actually dispatches
+// events promptly now. This proves that's real, not just present in code:
+// it never calls relayOnce() or waits anywhere near 5 minutes, so this would
+// time out if the fast path weren't actually running.
+describe("outbox fast-path dispatch", () => {
+  it("dispatches a newly-submitted application's outbox event without waiting for a relay poll tick", async () => {
+    const { token, orgSlug } = await registerOrg("Fast Path Org", "owner@fast-path.example");
+    const auth = { Authorization: `Bearer ${token}` };
+    const { jobId } = await createPublishedJob(auth, "Fast Path Role");
+    const job = await request(app).get(`/api/v1/jobs/${jobId}`).set(auth);
+    const jobSlug = job.body.publicSlug as string;
+
+    const apply = await request(app)
+      .post(`/api/v1/public/orgs/${orgSlug}/jobs/${jobSlug}/apply`)
+      .field("fullName", "Fast Path Applicant")
+      .field("email", "fast-path-applicant@fast-path.example");
+    expect(apply.status).toBe(202);
+
+    const org = await prisma.organization.findUniqueOrThrow({ where: { slug: orgSlug } });
+    const deadline = Date.now() + 2000;
+    let event = await prisma.outboxEvent.findFirst({
+      where: { orgId: org.id, type: EVENT_TYPES.APPLICATION_SUBMITTED },
+    });
+    while (event?.status !== "SENT" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      event = await prisma.outboxEvent.findFirst({ where: { orgId: org.id, type: EVENT_TYPES.APPLICATION_SUBMITTED } });
+    }
+
+    expect(event?.status).toBe("SENT");
+  });
+});
+
+// Regression coverage for a real bug found live against a running dev server
+// (not just by reading the code): both middleware/upload.ts's fileFilter and
+// multer's own file-size-limit check throw a plain Error/MulterError, neither
+// of which errorHandler.ts's typed branches (ApiError/ZodError/known Prisma
+// codes) recognized - both fell through to the generic 500 handler. This
+// directly contradicted ASSUMPTIONS.md's documented behavior ("anything else
+// is rejected at the upload boundary with a clear error") - a rejected upload
+// returned an opaque 500 "Internal server error", not a 4xx explaining why.
+// Fixed by having fileFilter throw ApiError.badRequest() (already handled)
+// and by mapping MulterError explicitly in errorHandler.ts.
+describe("resume upload validation", () => {
+  it("rejects an unsupported file type at the public apply endpoint with a clean 400, not a 500", async () => {
+    const { token, orgSlug } = await registerOrg("Upload Validation Org", "owner@upload-validation.example");
+    const auth = { Authorization: `Bearer ${token}` };
+    const { jobId } = await createPublishedJob(auth, "Upload Test Role");
+    const job = await request(app).get(`/api/v1/jobs/${jobId}`).set(auth);
+    const jobSlug = job.body.publicSlug as string;
+
+    const res = await request(app)
+      .post(`/api/v1/public/orgs/${orgSlug}/jobs/${jobSlug}/apply`)
+      .field("fullName", "Bad File Applicant")
+      .field("email", "bad-file@upload-validation.example")
+      .attach("resume", Buffer.from("not a real resume"), { filename: "resume.exe", contentType: "application/x-msdownload" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.type).not.toBe("internal-error");
+    expect(res.body.detail).toMatch(/PDF and DOCX/);
+  });
+
+  it("rejects an oversized resume with a clean 400, not a 500", async () => {
+    const { token, orgSlug } = await registerOrg("Upload Size Org", "owner@upload-size.example");
+    const auth = { Authorization: `Bearer ${token}` };
+    const { jobId } = await createPublishedJob(auth, "Upload Size Role");
+    const job = await request(app).get(`/api/v1/jobs/${jobId}`).set(auth);
+    const jobSlug = job.body.publicSlug as string;
+
+    const oversized = Buffer.alloc(11 * 1024 * 1024, 0x41); // default MAX_UPLOAD_MB is 10
+    const res = await request(app)
+      .post(`/api/v1/public/orgs/${orgSlug}/jobs/${jobSlug}/apply`)
+      .field("fullName", "Oversized File Applicant")
+      .field("email", "oversized@upload-size.example")
+      .attach("resume", oversized, { filename: "resume.pdf", contentType: "application/pdf" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.type).not.toBe("internal-error");
+  });
+});
+
+// Regression coverage for a real bug found live: the recruiter notification
+// bell's badge count was derived from `items.length` of a `limit=10`-capped
+// list (web/src/components/Layout.tsx) - accurate only while unread count
+// stayed under 10, then frozen forever past that point even though new
+// notifications kept arriving and being visible on the notifications page
+// itself. Fixed with a dedicated GET /notifications/unread-count backed by a
+// plain COUNT(*), with no list-size ceiling.
+describe("notification unread count", () => {
+  it("keeps counting past the list endpoint's page size, unlike items.length off a limited list", async () => {
+    const { token, orgSlug, userId } = await registerOrg("Unread Count Org", "owner@unread-count.example");
+    const auth = { Authorization: `Bearer ${token}` };
+    const org = await prisma.organization.findUniqueOrThrow({ where: { slug: orgSlug } });
+
+    // More than the frontend's limit=10 page size.
+    await prisma.notification.createMany({
+      data: Array.from({ length: 15 }, () => ({ orgId: org.id, userId, type: "application.submitted", payload: {} })),
+    });
+
+    const listRes = await request(app).get("/api/v1/notifications?unreadOnly=true&limit=10").set(auth);
+    expect(listRes.body.items.length).toBe(10); // the page is correctly capped
+
+    const countRes = await request(app).get("/api/v1/notifications/unread-count").set(auth);
+    expect(countRes.status).toBe(200);
+    expect(countRes.body.count).toBe(15); // but the count is not
+  });
+});
+
+// Regression coverage for a real bug found live: GET /notifications ordered
+// by `orderBy: { id: "desc" }` - lib/pagination.ts's own comment calls a
+// Prisma `id` field "uuid, effectively insertion-ordered enough," which is
+// false for a plain v4 UUID (Prisma's default `uuid()`): it's random, with
+// no correlation to creation order. Harmless for the several other list
+// endpoints using the same `orderBy: { id }` convention (candidates, jobs,
+// applications, duplicates - none of them promise newest-first), but a real,
+// visible bug for a notification feed, where reverse-chronological order is
+// the entire point - notifications appeared to jump around rather than
+// listing most-recent-first. Fixed with `orderBy: [{ createdAt: "desc" },
+// { id: "desc" }]`, verified here by creating rows with explicit createdAt
+// timestamps in a deliberately non-id-correlated order and asserting the
+// response comes back sorted by time, not insertion/id order.
+describe("notification ordering", () => {
+  it("returns notifications ordered by creation time, not by id", async () => {
+    const { token, orgSlug, userId } = await registerOrg("Notification Order Org", "owner@notification-order.example");
+    const auth = { Authorization: `Bearer ${token}` };
+    const org = await prisma.organization.findUniqueOrThrow({ where: { slug: orgSlug } });
+
+    const now = Date.now();
+    // Deliberately created in an order where insertion/id order and
+    // createdAt order diverge - the middle-timestamped row is created last.
+    const oldest = await prisma.notification.create({
+      data: { orgId: org.id, userId, type: "application.submitted", payload: {}, createdAt: new Date(now - 60_000) },
+    });
+    const newest = await prisma.notification.create({
+      data: { orgId: org.id, userId, type: "application.submitted", payload: {}, createdAt: new Date(now) },
+    });
+    const middle = await prisma.notification.create({
+      data: { orgId: org.id, userId, type: "application.submitted", payload: {}, createdAt: new Date(now - 30_000) },
+    });
+
+    const res = await request(app).get("/api/v1/notifications?limit=10").set(auth);
+    expect(res.status).toBe(200);
+    const ids = res.body.items.map((n: { id: string }) => n.id);
+    expect(ids).toEqual([newest.id, middle.id, oldest.id]);
+  });
+});
+
+describe("notification removal", () => {
+  it("lets a user remove their own notification, and never someone else's", async () => {
+    const orgA = await registerOrg("Notification Remove Org A", "owner-a@notification-remove.example");
+    const orgB = await registerOrg("Notification Remove Org B", "owner-b@notification-remove.example");
+    const authA = { Authorization: `Bearer ${orgA.token}` };
+    const authB = { Authorization: `Bearer ${orgB.token}` };
+    const org = await prisma.organization.findUniqueOrThrow({ where: { slug: orgA.orgSlug } });
+
+    const notification = await prisma.notification.create({
+      data: { orgId: org.id, userId: orgA.userId, type: "application.submitted", payload: {} },
+    });
+
+    const crossOrgAttempt = await request(app).delete(`/api/v1/notifications/${notification.id}`).set(authB);
+    expect(crossOrgAttempt.status).toBe(404);
+
+    const ownRemoval = await request(app).delete(`/api/v1/notifications/${notification.id}`).set(authA);
+    expect(ownRemoval.status).toBe(204);
+
+    const stillThere = await prisma.notification.findUnique({ where: { id: notification.id } });
+    expect(stillThere).toBeNull();
   });
 });

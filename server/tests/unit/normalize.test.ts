@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalizeEmail, normalizeName, normalizePhone } from "../../src/domain/dedupe/normalize.js";
+import { normalizeEmail, normalizeName, normalizePhone } from "core/domain/dedupe/normalize.js";
 
 describe("normalizeEmail", () => {
   it("lowercases and trims", () => {

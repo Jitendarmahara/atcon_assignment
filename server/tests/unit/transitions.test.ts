@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { JobStage } from "@prisma/client";
-import { validateTransition } from "../../src/domain/pipeline/transitions.js";
+import { validateTransition } from "core/domain/pipeline/transitions.js";
 
 function stage(overrides: Partial<JobStage> & Pick<JobStage, "id" | "kind" | "order">): JobStage {
   return {
