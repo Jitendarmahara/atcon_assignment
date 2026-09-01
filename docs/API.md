@@ -87,6 +87,7 @@ All routes are under `/api/v1` unless noted. Authenticated routes require
 | Method & path | Auth | Notes |
 |---|---|---|
 | `GET /notifications` | any | `?unreadOnly=true` |
+| `GET /notifications/unread-count` | any | Plain `COUNT(*)`, not `items.length` off a `limit`-capped list - see ASSUMPTIONS.md for why that distinction is load-bearing |
 | `POST /notifications/:notificationId/read` | any (own only) | |
 | `GET /admin/queues` | `ADMIN` | BullMQ queue depths + the outbox dead-letter list |
 
@@ -97,6 +98,28 @@ All routes are under `/api/v1` unless noted. Authenticated routes require
 | `GET /public/orgs/:orgSlug/jobs` | Published jobs for that org |
 | `GET /public/orgs/:orgSlug/jobs/:jobSlug` | One published job |
 | `POST /public/orgs/:orgSlug/jobs/:jobSlug/apply` | `multipart/form-data`: `fullName`, `email`, `phone?`, `resume?`. Rate-limited per IP. Returns `202` with `{ candidateId, applicationId }` |
+
+## Candidate portal (a candidate's own login - separate from recruiter auth)
+
+Authenticated with `Authorization: Bearer <candidate accessToken>` from `POST /candidate-auth/login` -
+a completely separate token type from a recruiter's (see `lib/jwt.ts`'s `type` claim); one can never
+be used in place of the other. Not org-scoped: the same email can have applications across multiple
+orgs, all visible from one account.
+
+| Method & path | Auth | Notes |
+|---|---|---|
+| `POST /candidate-auth/register` | none | `{ fullName, email, password }`. `409` if already registered |
+| `POST /candidate-auth/login` | none | Returns `{ account, accessToken, refreshToken }` |
+| `POST /candidate-auth/refresh` | none | |
+| `GET /candidate-auth/me` | candidate | |
+| `POST /candidate-auth/logout` | candidate | Revokes every outstanding refresh token (bumps `CandidateAccount.tokenVersion`) |
+| `POST /candidate-auth/forgot-password` | none | Always `202`, regardless of whether the email is registered - never confirms/denies an account's existence |
+| `POST /candidate-auth/reset-password` | none | `{ token, newPassword }`. Single-use, 30-minute expiry |
+| `GET /candidate-portal/applications` | candidate | Every application matching the caller's own email, across every org |
+| `GET /candidate-portal/applications/:applicationId/timeline` | candidate | `404` if the application isn't the caller's own. Deliberately omits `reason`/`actor` - internal recruiter fields, never returned to a candidate |
+| `GET /candidate-portal/open-roles` | candidate | Every `PUBLISHED` job across every org, excluding ones already applied to. Applying still goes through the existing public apply endpoint below, just with name/email pre-filled from the account - no separate "browse jobs" page |
+| `GET /candidate-portal/notifications/unread-count` | candidate | Count of `StageEvent`s (across every application) newer than the account's `notificationsViewedAt` watermark - the candidate-side equivalent of the recruiter bell, without a second notification table |
+| `POST /candidate-portal/notifications/mark-viewed` | candidate | Bumps that watermark to now |
 
 ## Real-time
 

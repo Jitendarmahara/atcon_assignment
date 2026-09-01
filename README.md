@@ -45,7 +45,9 @@ cd server && npx prisma migrate deploy && cd ..
 #    with realistic stage histories so the dashboard isn't empty on first load)
 pnpm db:seed
 
-# 5. Run everything (API on :4000, worker process, web app on :5173)
+# 5. Run everything: API on :4000, web app on :5173, the outbox relay, all 4
+#    queue workers (resume-parse, dedupe-scan, notifications, scheduled-
+#    maintenance), and packages/core's own build watcher - one terminal.
 pnpm dev
 ```
 
@@ -55,14 +57,16 @@ Then:
   Demo login: `admin@acme-recruiting.test` / `password123` (see `server/prisma/seed.ts` for
   every seeded user, across all four roles, in both seeded orgs)
 - **Public careers site**: http://localhost:5173/public/acme-recruiting
+- **Candidate portal** (a separate login — track your own applications across every org):
+  http://localhost:5173/candidate/register
 - **API docs (OpenAPI/Swagger UI)**: http://localhost:4000/api/docs
 - **MailHog inbox** (all outbound email lands here in dev): http://localhost:8025
 
 ### Environment
 
 Copy `server/.env.example` to `server/.env` — the defaults already match `docker-compose.yml`.
-Resume parsing works fully offline via a heuristic parser; setting `ANTHROPIC_API_KEY` upgrades it
-to an LLM-based structurer with automatic fallback (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#resume-parsing)).
+Resume parsing is LLM-only: set `DEEPSEEK_API_KEY` or `ANTHROPIC_API_KEY` for it to work at all (see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#resume-parsing) for why there's no offline fallback).
 
 ### Running tests
 
@@ -77,15 +81,53 @@ pnpm test
 (One-time setup — the test DB is separate from the dev/demo database so `pnpm test` never
 touches your seeded data.)
 
+## Production deployment
+
+One command builds and starts the entire stack as containers - API, web (nginx), the outbox
+relay, and all 4 queue workers, plus Postgres/Redis/MailHog. Migrations run automatically first;
+nothing else starts until they've applied:
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file server/.env up -d --build
+```
+
+- **Recruiter app**: http://localhost:5173
+- **API**: http://localhost:4000 (`/api/docs`, `/health`, `/ready`)
+- **MailHog**: http://localhost:8025
+
+This stack's Postgres starts **empty** - separate from your dev database's seeded demo data.
+Register a fresh org through the UI, or seed the same demo data dev uses (one-time, and it wipes
+whatever's already there, so don't run it against real data):
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file server/.env run --rm migrate npx tsx prisma/seed.ts
+```
+
+Login afterward: `admin@acme-recruiting.test` / `password123`.
+
+Tear down with `docker compose -f docker-compose.prod.yml down` (add `-v` to also drop its
+Postgres/Redis volumes). Runs under its own isolated project name (`ats-prod`), so it can't
+collide with or tear down `docker-compose.yml`'s dev containers even if both are running at once.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for why each worker is its own service (real
+per-queue scaling, real crash isolation) and how that maps to Kubernetes in an actual deployment.
+
 ## Project layout
 
 ```
-server/          Express API + BullMQ worker + Prisma schema/migrations/seed
-  src/domain/    Framework-free business logic: pipeline state machine, dedupe scoring, resume parsing
-  src/modules/   HTTP layer per resource: routes → controller → service → schema (Zod)
-  src/events/    Transactional outbox + relay (see ARCHITECTURE.md)
-  src/queues/    BullMQ queue definitions + job processors
+packages/core/   Shared by server/ and workers/: Prisma schema/client, domain logic, queue
+  src/domain/    definitions + job processors, outbox + relay, lib/ (prisma, jwt, mailer, storage,
+  src/queues/    logger, ...), and every modules/*/service.ts (business logic, not the HTTP layer -
+  src/events/    see ARCHITECTURE.md's "Package layout"). Always consumed via its compiled dist/.
+  src/lib/
+  src/modules/
+  prisma/        schema.prisma, migrations/, seed.ts
+server/          Express API only - a separate deployable from workers/ (own Docker image)
+  src/modules/   HTTP layer per resource: routes → controller → schema (Zod); service.ts lives in core
+  src/middleware/  requireAuth, rateLimit, upload, errorHandler
   tests/         Vitest: unit tests for domain logic, Supertest integration tests for the API
+workers/         One entrypoint per queue + the relay process, each its own OS process, own
+  src/           Docker image (workers/Dockerfile) - see ARCHITECTURE.md
 web/             React + Vite recruiter app + public careers site
 docs/            The four documents linked above
 ```

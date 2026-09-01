@@ -35,24 +35,63 @@ aren't buried in framework ceremony.
                                 │ in the same transaction       │ SKIP LOCKED
                                 ▼                               │
                     ┌─────────────────────────┐                │
-                    │  Outbox relay (1s poll) │◀───────────────┘
-                    │  runs inside worker.ts  │
+                    │  Outbox relay process   │◀───────────────┘
+                    │  (workers/src/relay.ts, │
+                    │   5-min backstop poll)  │
                     └───────────┬─────────────┘
-                                │ enqueues
+                                │ enqueues, jobId = outbox row id
                                 ▼
                     ┌─────────────────────────┐        ┌──────────────┐
-                    │   BullMQ queues + Redis │───────▶│   MailHog    │
-                    │  resume-parse, email-   │        │  (SMTP sink) │
-                    │  send, dedupe-scan,     │
-                    │  interview-reminder,    │        ┌──────────────┐
-                    │  metrics-rollup         │───────▶│ Local disk / │
-                    └─────────────────────────┘        │ StorageAdapter│
-                                                        └──────────────┘
+                    │  Redis (BullMQ queues)  │        │   MailHog    │
+                    │  resume-parse,          │        └──────────────┘
+                    │  dedupe-scan,           │        ┌──────────────┐
+                    │  notifications,         │        │ Local disk / │
+                    │  scheduled-maintenance  │        │ StorageAdapter│
+                    └───────────┬─────────────┘        └──────────────┘
+                                │
+                                ▼
+                    4 separate worker processes, one per queue —
+                    workers/src/{resumeParse,dedupeScan,notifications,
+                    scheduledMaintenance}.ts — each with its own
+                    concurrency and its own restart lifecycle
 ```
 
-The API process and the worker process (`src/index.ts` and `src/worker.ts`) are separate from
-the start — a slow LLM call parsing a resume never blocks a request-handling event loop, and
-either can be scaled or restarted independently.
+The API (`server/`), the outbox relay, and each of the 4 queue workers (`workers/src/relay.ts`,
+`workers/src/{resumeParse,dedupeScan,notifications,scheduledMaintenance}.ts`) are 6 independent OS
+processes from the start — a slow LLM call parsing a resume can never block a request-handling
+event loop or the `notifications` queue's own throughput, and any one of the 6 can be scaled,
+deployed, or restarted without touching the other 5. They share nothing except Postgres and Redis:
+no in-process state, no shared event loop. Process-per-queue, rather than one process holding all 4
+`Worker` instances (the simpler alternative), buys real isolation — a crash in one queue's
+processor, a burst of slow `resume-parse` jobs, a bad deploy of just the `notifications` handler —
+none of it can starve or take down the other queues, because they're not sharing a Node event loop
+or a process's memory. `resume-parse` and `dedupe-scan` are deliberately two queues, not one,
+despite both being "figure out what's true about this candidate" conceptually: `resume-parse` calls
+out to an LLM with unpredictable latency, `dedupe-scan` is local and normally sub-second, and
+merging them would let a burst of slow LLM calls starve dedupe-scan's worker pool even though it
+has no external dependency of its own. `notifications`, by contrast, genuinely does merge multiple
+job types (every outbound email plus the delayed interview reminder) onto one queue, because those
+*do* share a bottleneck (SMTP, fast, no external LLM) — see
+`packages/core/src/queues/definitions.ts` for the full reasoning on both calls. The relay gets its
+own process for a related reason: it isn't tied to any single queue (`dispatch()` can enqueue onto
+any of the 4 depending on the event type), so folding it into one queue's worker would create an
+arbitrary dependency between an unrelated queue and outbox delivery. `workers/src/shared.ts` is the
+one place the SIGINT/SIGTERM/uncaught-exception handling and graceful-shutdown logic is written —
+every one of the 5 non-API processes calls into it rather than repeating it; it also runs a small
+internal HTTP listener (`GET /health` on a container-internal-only port) purely so a container
+orchestrator has something to ask "is this process's event loop alive," since a worker otherwise
+never accepts inbound connections at all.
+
+**Package layout**: `server/` (the API's HTTP layer — routes, controllers, Zod schemas, Express
+middleware) and `workers/` (the 6 process entrypoints above) are separate top-level packages, both
+depending on `packages/core/` (Prisma client + schema, `domain/` business logic, `queues/`
+definitions and processors, `events/` outbox + relay, shared `lib/`) via the pnpm workspace. This
+mirrors the runtime reality directly: `server/` and `workers/` are genuinely different deployables
+— separate Docker images (`server/Dockerfile`, `workers/Dockerfile`), separate containers, separate
+scaling, separate crash domains — so the repo structure doesn't nest one inside the other's source
+tree. `packages/core` is always consumed via its compiled `dist/` (both in dev, via a
+`tsc --watch` process, and in the Docker build) rather than importing raw `.ts` source across the
+package boundary.
 
 ## Data model
 
@@ -114,25 +153,41 @@ and exactly one new `StageEvent` row.
 
 Domain events (`resume.uploaded`, `application.submitted`, `application.stage_changed`,
 `interview.scheduled`) are written to an `OutboxEvent` row inside the *same* database transaction
-as the change they describe. A relay (`events/relay.ts`), running inside `worker.ts` on a 1-second
-poll, ticks in two phases so a slow or unreachable Redis can never hold a database transaction
-hostage:
+as the change they describe. Dispatch to the matching BullMQ queue happens through two paths that
+share the same underlying logic (`dispatch()`, `events/relay.ts`):
 
-1. **Claim** — a short transaction selects pending/lease-expired rows with `FOR UPDATE SKIP LOCKED`
-   (safe for multiple relay instances) and flips them to `PROCESSING` with a 60-second lease, then
-   commits immediately.
-2. **Dispatch** — outside any open transaction, each claimed row is sent to the matching BullMQ
-   queue using a deterministic `jobId` derived from the outbox row's id (so a crash-and-restart
-   between "enqueued" and "marked SENT" produces a duplicate `add()` call that BullMQ simply
-   dedupes, not a duplicate email), then marked `SENT`.
+1. **Fast path** (`dispatchNowBestEffort()`) — called directly from the write path (the
+   `applications`/`interviews`/`candidates` services) right after the transaction that wrote the
+   outbox row commits. Fire-and-forget: it's never awaited into the request/response cycle, and a
+   failure here (Redis down, a crash mid-call) does nothing further — no retry bookkeeping, just
+   leaves the row `PENDING` exactly as if this path had never run. In the common case this is what
+   actually dispatches an event, typically within milliseconds of the write.
+2. **Backstop poll** (`relayOnce()`, run inside its own dedicated `workers/relay.ts` process every
+   5 minutes) — the correctness net
+   for whatever the fast path missed, for any reason. It ticks in two phases so a slow or
+   unreachable Redis can never hold a database transaction hostage:
+   - **Claim** — a short transaction selects pending/lease-expired rows with `FOR UPDATE SKIP LOCKED`
+     (safe for multiple relay instances) and flips them to `PROCESSING` with a 60-second lease, then
+     commits immediately.
+   - **Dispatch** — outside any open transaction, each claimed row is sent to the matching BullMQ
+     queue using a deterministic `jobId` derived from the outbox row's id, then marked `SENT`.
+
+That same deterministic `jobId` is what makes the two paths safe to occasionally race on the same
+row (rare, since the fast path almost always finishes long before the next 5-minute tick): a
+crash-and-restart between "enqueued" and "marked SENT," or the fast path and a tick both attempting
+the same row, produces a duplicate `add()` call that BullMQ simply dedupes, never a duplicate email
+or parse job.
 
 This is the actual reliability story: **a transaction that rolls back never produced an event, and
-Redis being briefly down never loses one** — the row just sits `PENDING`/`PROCESSING` until the
-relay's next tick (or, if a dispatch was mid-flight when the process crashed, until its lease
-expires and another tick reclaims it) — and no single tick can pin a Postgres connection open for
-longer than a Redis call actually takes, since dispatch never runs inside the claiming transaction.
-A dispatch failure gets exponential backoff up to 8 attempts, then flips to `FAILED` and surfaces
-at `GET /api/v1/admin/queues` as a dead-letter row for manual inspection.
+Redis being briefly down never loses one** — the row just sits `PENDING`/`PROCESSING` until either
+path successfully dispatches it (or, if a dispatch was mid-flight when the process crashed, until
+its lease expires and a tick reclaims it) — and no single tick can pin a Postgres connection open
+for longer than a Redis call actually takes, since dispatch never runs inside the claiming
+transaction. The 5-minute backstop interval is safe specifically because the durability guarantee
+never depended on how often that poll runs, only on the row existing in Postgres — slowing it down
+changes worst-case latency for a *missed* fast-path attempt (rare), never correctness. A dispatch
+failure (from either path) gets exponential backoff up to 8 attempts, then flips to `FAILED` and
+surfaces at `GET /api/v1/admin/queues` as a dead-letter row for manual inspection.
 
 ### 3. Duplicate detection (`domain/dedupe/`)
 
@@ -183,22 +238,57 @@ Two independently-swappable stages, both behind interfaces (`domain/resume/`):
    section-header heuristic downstream. (`pdf-parse`, a more commonly reached-for library, was
    tried first and dropped: it bundles a frozen 2018-era pdf.js that throws on any PDF using
    cross-reference streams — the default output of LibreOffice, Chrome's print-to-PDF, and modern
-   Word/Google Docs exports. `pdfjs-dist` is Mozilla's actual, actively-maintained engine.)
-2. **Structure** (`heuristicStructurer.ts` / `claudeStructurer.ts`, picked by `index.ts`) — a
-   regex/section-header heuristic that always works offline, or `claude-sonnet-5` via structured
-   tool-use when `ANTHROPIC_API_KEY` is set. The LLM path is a strict enhancement: any failure
-   (network, rate limit, malformed response) falls back to the heuristic rather than failing the
-   job. Every `Resume.parserVersion` records which one actually produced the result.
+   Word/Google Docs exports. `pdfjs-dist` is Mozilla's actual, actively-maintained engine.) Also
+   strips a duplicated content layer some resume-export tools embed - see `dropRepeatedContent()`
+   and the changelog below.
+2. **Structure** (`deepseekStructurer.ts` / `claudeStructurer.ts`, picked by `index.ts`) — LLM-only,
+   via forced structured tool-use, whichever of `DEEPSEEK_API_KEY` / `ANTHROPIC_API_KEY` is set
+   (DeepSeek checked first). **Deliberately no offline fallback.** An earlier version fell back to
+   a regex/keyword heuristic structurer whenever the LLM call failed, on the theory that some
+   structure beats none. In practice the heuristic routinely produced confidently-wrong output on
+   real resumes - a "KEY PROJECTS" header it didn't recognize corrupted the experience list with a
+   garbled entry; skill category labels ("Languages:") ended up glued onto the first skill in that
+   group; personal projects and paid jobs were indistinguishable once merged into one array - all
+   still carrying a `PARSED` badge indistinguishable at a glance from a correct result. A resume
+   that fails clearly (`FAILED` status, a real error message, retryable by re-uploading) is a
+   better outcome for a recruiter than one that "parsed" into data they can't trust. BullMQ's own
+   retry policy (5 attempts, exponential backoff) is the resilience layer instead - a transient
+   failure never reaches a recruiter as a bad parse; see the changelog below for the full incident.
+   Every `Resume.parserVersion` records which structurer actually produced the result.
 
 ## Background jobs
 
-| Queue | Trigger | Idempotency |
-|---|---|---|
-| `resume-parse` | `resume.uploaded` outbox event | job id = outbox row id |
-| `email-send` | `application.submitted`, `application.stage_changed`, `interview.scheduled` | same |
-| `interview-reminder` | scheduled by the relay as a **delayed** job at (interview time − 24h) | re-checks interview status at fire time; a no-op if cancelled/rescheduled |
-| `dedupe-scan` | `POST /candidates/:id/rescan-duplicates` | re-running is safe — it upserts links, never duplicates them |
-| `metrics-rollup` | repeatable, nightly cron | upserts by `(orgId, metric, scope)` |
+Each queue is consumed by its own dedicated process (`workers/src/*.ts`), never shared with another
+queue:
+
+| Queue | Job names (dispatched by name within the queue) | Idempotency | Process | Replicas today |
+|---|---|---|---|---|
+| `resume-parse` | `parse` | job id = outbox row id | `workers/resumeParse.ts` | 1 |
+| `dedupe-scan` | `rescan` (`POST /candidates/:id/rescan-duplicates`) | re-running is safe — upserts links, never duplicates them | `workers/dedupeScan.ts` | 1 |
+| `notifications` | `application-confirmation`, `stage-changed-notify`, `interview-invite`, `candidate-password-reset`, `remind` (delayed, fires at interview time − 24h) | job id = outbox row id (or none, for the two directly-enqueued ones — see `queues/processors/notifications.ts`) | `workers/notifications.ts` | 1 |
+| `scheduled-maintenance` | `metrics-rollup` (nightly, 2am), `cleanup-expired-tokens` (nightly, 3am) | both upsert/delete-by-condition, safe to re-run | `workers/scheduledMaintenance.ts` | 1 (must never exceed 1 — a nightly job must never overlap itself) |
+
+`notifications` deliberately merges 5 job types onto one queue — they all share a bottleneck (SMTP,
+fast, no external dependency) — while `resume-parse` and `dedupe-scan` stay separate despite both
+being "candidate intelligence" work, because they don't share a bottleneck (external LLM latency vs.
+local Postgres). See `packages/core/src/queues/definitions.ts` for the full reasoning.
+
+Replica count, not in-process concurrency, is the scaling knob: every worker runs BullMQ concurrency
+1, and parallelism for a queue comes from running its entrypoint as N independent OS processes —
+`workers/src/shared.ts`'s doc comment explains why concurrency and replica count are kept as
+separate, deliberately distinct knobs. In production that means each queue worker as its own
+Kubernetes Deployment with its own Horizontal Pod Autoscaler, scaled primarily on that queue's
+BullMQ depth (e.g. KEDA's Redis scaler watching the queue's list length) with CPU utilization as a
+secondary signal, not the primary one — every one of these workers is I/O-bound (an LLM call, an
+SMTP send, a Postgres query), so a real backlog can sit at near-zero CPU the whole time; CPU alone
+would never trigger scale-up for the workload that actually needs it. `scheduled-maintenance` is
+deliberately excluded from all of this — pinned at exactly 1 replica always, since a second replica
+autoscaled in risks the nightly rollup double-running, which is worse than not scaling at all. 1
+replica per queue today (`docker-compose.prod.yml`, this repo's own deploy target), since there's
+no real load in this demo to justify more — `resume-parse` is the one most likely to need it first
+if that changes (LLM-call latency is the one genuinely unpredictable cost among the 4 queues). Each
+process opens its own dedicated Redis connection (BullMQ's `Worker` issues blocking commands, which
+can't share a connection with a `Queue` producer — see `queues/definitions.ts`).
 
 All queues use exponential backoff (5 attempts, base 2s) and bounded retention
 (`removeOnComplete`/`removeOnFail` counts) so Redis memory doesn't grow unbounded in a long-running
@@ -276,6 +366,59 @@ interval). They're now pushed live over Server-Sent Events, backed by Redis pub/
   missed (a brief disconnect, a dropped Redis message), rather than trusting push alone to never lose
   one.
 
+## Candidate portal
+
+A second, completely separate login (`modules/candidateAuth/`, `modules/candidatePortal/`) so a
+candidate can see every application they've submitted and a live-updating record of stage changes,
+independent of the recruiter-facing app covered above.
+
+- **`CandidateAccount` is not org-scoped**, unlike `User`. The same person can apply to multiple
+  orgs' public job boards with the same email and should see all of it from one login — so unlike
+  every other model in this system, there's deliberately no `orgId` here, and therefore no Postgres
+  Row-Level Security policy on it either (RLS scopes tenant data; this table has none to scope).
+  It's matched to the existing per-org `Candidate`/`Application` rows by normalized email at *read*
+  time (`domain/dedupe/normalize.ts`'s same signal, not a foreign key) — a `CandidateAccount` can
+  predate, postdate, or never have a matching `Candidate` row.
+- **A fully separate JWT identity.** `candidate_access`/`candidate_refresh` token types
+  (`lib/jwt.ts`), reusing the same two secrets as recruiter tokens but relying on the `type` claim
+  discriminator to make one type structurally unusable as the other — the same defense-in-depth
+  principle that already separates access from refresh tokens, applied one level further.
+  `middleware/requireCandidateAuth.ts` is the candidate equivalent of `requireAuth.ts`, and —
+  critically — it never sets `req.auth`, so `lib/asyncHandler.ts` never establishes an RLS org
+  scope for a candidate-authenticated request. That's not an oversight; it's exactly what makes the
+  "list every application across every org" query below legal to run at all.
+- **The update feed is the existing `StageEvent` audit trail, read back for the candidate it belongs
+  to — not a second notification pipeline.** `GET /candidate-portal/applications/:id/timeline`
+  queries the same table `GET /applications/:id/events` already does, with an explicit `select`
+  (never `include`) that omits `reason` (an internal recruiter note) and `actor` (which staff member
+  acted) — a candidate sees "you've reached the Interview round," never who moved them there or why
+  a rejection note said what it said.
+- **Password reset is the one email in this system that deliberately does not go through the
+  transactional outbox.** `OutboxEvent.orgId` is `NOT NULL`, and a reset email has no single org to
+  attribute it to — but more fundamentally, the outbox's guarantee matters for events that have no
+  other way to happen again if missed (an application, a stage change); a reset email doesn't share
+  that property, since the candidate can just click "forgot password" again. It's still enqueued
+  directly onto the same `email-send` BullMQ queue, getting the same retry/backoff as everything
+  else, matching the precedent `candidates/service.ts:rescanDuplicates()` already set for another
+  naturally user-retriable action. Reset tokens are single-use, sha256-hashed at rest (never stored
+  in plaintext, same discipline as passwords), and a successful reset bumps `tokenVersion` to
+  invalidate every outstanding refresh token, mirroring `logout()`.
+- **The candidate's own notification bar reuses the same "no second table" approach as the update
+  feed, applied to counting instead of listing.** Rather than a per-row read flag (which would need
+  its own notification table), `CandidateAccount.notificationsViewedAt` is a single watermark;
+  "unread" is `COUNT(StageEvent)` across every one of the candidate's applications newer than it.
+  `POST /candidate-portal/notifications/mark-viewed` bumps it - the frontend calls this a few
+  seconds after the dashboard loads, since the dashboard *is* the update feed, so having it open
+  already counts as having seen it.
+- **Open roles are shown directly on the dashboard, not a separate "browse jobs" page** -
+  `GET /candidate-portal/open-roles` lists every `PUBLISHED` job across every org, excluding ones
+  already applied to (so the UI never offers an "Apply" that would `409` against the
+  `(candidateId, jobId)` unique constraint). Applying still goes through the existing, already-public
+  `POST /public/orgs/:orgSlug/jobs/:jobSlug/apply` - no new apply endpoint, just the candidate's
+  name/email pre-filled from their account instead of asking again. The per-org public careers site
+  (`/public/:orgSlug/jobs`) isn't replaced by this - it's what a company links from its own site;
+  this is the complementary "I'm already logged in, let me see everything at once" view.
+
 ## API design
 
 - **Cursor pagination** (`lib/pagination.ts`) on `id`, not `OFFSET` — avoids page drift on a
@@ -297,9 +440,13 @@ What's already built to scale, and what the next step would be:
 
 - **Stateless API** — no in-process session state; JWTs mean any number of API instances can sit
   behind a load balancer today.
-- **Separate worker process** — scales independently of the API; multiple worker instances would
-  compete correctly for BullMQ jobs and for outbox rows (`FOR UPDATE SKIP LOCKED` is safe for
-  concurrent relays).
+- **One process per queue, not one process for all queues** — each of the 4 workers scales,
+  deploys, and restarts independently of the API *and* of each other. Horizontally scaling just
+  `resume-parse` under load (the one most likely to need it, given LLM latency) means running more
+  copies of exactly that one process — the other 3 queues are untouched, and their processes never
+  even restart. Multiple instances of the same worker (or the relay) compete correctly for jobs and
+  for outbox rows: BullMQ's own consumer-group semantics for jobs, and `FOR UPDATE SKIP LOCKED` for
+  the relay's row claims, so nothing needs to be single-instance except by choice.
 - **Read-heavy analytics** — live SQL is correct and fast at this dataset size (tens of thousands
   of `StageEvent` rows). Past that, `MetricsRollup` is already the landing spot to switch
   dashboard reads to a cached snapshot instead of the live query — the schema and the nightly job
