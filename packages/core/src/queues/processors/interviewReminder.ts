@@ -3,7 +3,9 @@ import { prisma } from "../../lib/prisma.js";
 import { sendEmail } from "../../lib/mailer.js";
 
 // Scheduled as a delayed job for (interview time - 24h) when the interview
-// is created; see events/relay.ts. Re-checks status at fire time so a
+// is created; see events/relay.ts. Dispatched from the notifications queue
+// (processors/notifications.ts) alongside outbound email, since both share
+// the same fast/SMTP-bound worker pool. Re-checks status at fire time so a
 // cancelled/rescheduled interview doesn't send a stale reminder.
 export async function processInterviewReminder(job: Job<{ interviewId: string }>) {
   const interview = await prisma.interview.findUnique({

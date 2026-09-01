@@ -2,11 +2,19 @@ import type { Job } from "bullmq";
 import { prisma } from "../../lib/prisma.js";
 import { sendEmail } from "../../lib/mailer.js";
 import { notifyOrgRecruiters } from "../../lib/notify.js";
+import { processInterviewReminder } from "./interviewReminder.js";
 import type { ApplicationStageChangedPayload, ApplicationSubmittedPayload } from "../../events/types.js";
 
-// Single queue, dispatched by job name - keeps one Worker/concurrency knob
-// for all outbound email rather than one per email type.
-export async function processEmailSend(job: Job) {
+interface CandidatePasswordResetPayload {
+  email: string;
+  fullName: string;
+  resetUrl: string;
+}
+
+// Single queue for everything that notifies a person - outbound email and
+// the (delayed) interview reminder share a bottleneck (SMTP, fast, no
+// external LLM dependency), dispatched by job name onto one worker pool.
+export async function processNotifications(job: Job) {
   switch (job.name) {
     case "application-confirmation":
       return handleApplicationConfirmation(job as Job<ApplicationSubmittedPayload>);
@@ -14,6 +22,10 @@ export async function processEmailSend(job: Job) {
       return handleStageChanged(job as Job<ApplicationStageChangedPayload>);
     case "interview-invite":
       return handleInterviewInvite(job as Job<{ interviewId: string }>);
+    case "candidate-password-reset":
+      return handleCandidatePasswordReset(job as Job<CandidatePasswordResetPayload>);
+    case "remind":
+      return processInterviewReminder(job as Job<{ interviewId: string }>);
     default:
       // Forward-compatible no-op for a job name this build doesn't know about.
       return;
@@ -91,4 +103,13 @@ async function handleInterviewInvite(job: Job<{ interviewId: string }>) {
       `<p>You're on the interview panel for ${interview.application.candidate.fullName} (${interview.application.job.title}) at ${when}.</p>`,
     );
   }
+}
+
+async function handleCandidatePasswordReset(job: Job<CandidatePasswordResetPayload>) {
+  const { email, fullName, resetUrl } = job.data;
+  await sendEmail(
+    email,
+    "Reset your password",
+    `<p>Hi ${fullName},</p><p>Click below to reset your password. This link expires in 30 minutes.</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>If you didn't request this, you can safely ignore this email.</p>`,
+  );
 }
