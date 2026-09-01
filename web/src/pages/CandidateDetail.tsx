@@ -1,7 +1,7 @@
-import { useState, type FormEvent } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useEffect, useState, type FormEvent } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowLeft, CalendarPlus, CheckCircle2, Mail, Phone, UploadCloud } from "lucide-react";
+import { AlertTriangle, ArrowLeft, CalendarPlus, CheckCircle2, Mail, Phone, Sparkles, UploadCloud } from "lucide-react";
 import { api, ApiError } from "../lib/api";
 import { useAuth } from "../hooks/useAuth";
 import { canManage, type Application, type Candidate, type DuplicateLink, type OrgUser, type Resume, type StageEvent } from "../lib/types";
@@ -19,6 +19,20 @@ const RESUME_BADGE: Record<Resume["parseStatus"], string> = {
   PARSING: "badge-amber",
   PENDING: "badge-amber",
 };
+
+// parserVersion (Resume.parserVersion) records which structurer produced a
+// result - always an LLM structurer's own version string now, e.g.
+// "deepseek-chat@1" / "claude-sonnet-5@1" (domain/resume/index.ts). The
+// "heuristic" branch below only ever matches a resume parsed before parsing
+// became LLM-only (see ASSUMPTIONS.md's changelog) - kept so that old,
+// already-parsed data still gets a correct, honest label instead of an
+// "Unknown parser" fallback, not because the parser itself still exists.
+function parserLabel(parserVersion: string | null): { text: string; isAi: boolean } {
+  if (!parserVersion) return { text: "Unknown parser", isAi: false };
+  if (parserVersion.startsWith("heuristic")) return { text: "Parsed by offline heuristic (legacy)", isAi: false };
+  const engine = parserVersion.startsWith("deepseek") ? "DeepSeek" : parserVersion.startsWith("claude") ? "Claude" : parserVersion;
+  return { text: `AI-parsed (${engine})`, isAi: true };
+}
 
 function Timeline({ applicationId }: { applicationId: string }) {
   const { data } = useQuery({
@@ -176,8 +190,23 @@ export default function CandidateDetail() {
   const { user } = useAuth();
   const isManager = canManage(user?.role);
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [scheduling, setScheduling] = useState<string | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Landed on here from JobDetail.tsx's kanban drop prompt ("schedule their
+  // interview now?") - opens straight to the form for that application
+  // instead of making the recruiter find "Schedule interview" again
+  // themselves. Read once at mount (lazy initializer) rather than in an
+  // effect, then the param is stripped so a later refresh of this same page
+  // doesn't keep reopening it.
+  const [scheduling, setScheduling] = useState<string | null>(() => searchParams.get("scheduleFor"));
   const [showUpload, setShowUpload] = useState(false);
+
+  useEffect(() => {
+    if (!searchParams.has("scheduleFor")) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete("scheduleFor");
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const {
     data: candidate,
@@ -186,6 +215,21 @@ export default function CandidateDetail() {
   } = useQuery({
     queryKey: ["candidate", candidateId],
     queryFn: () => api.get<CandidateDetailDto>(`/candidates/${candidateId}`),
+    // Without this, a resume left mid-parse when the page loaded never
+    // updates on its own - nothing pushes a completion event to this page,
+    // so the recruiter has to know to manually reload. Poll briefly while a
+    // parse is actually in flight (a few seconds to ~15s in practice, LLM
+    // latency); stop once it resolves to PARSED/FAILED, so an already-parsed
+    // candidate's page never polls at all. PENDING is included, not just
+    // PARSING - right after an upload, before the worker has even picked the
+    // job up, that's the status the very next refetch actually returns; only
+    // checking PARSING here missed that window and never started polling at
+    // all (caught live: a fresh upload just sat there with no visible
+    // change until the tab was manually reloaded).
+    refetchInterval: (query) => {
+      const status = query.state.data?.resumes[0]?.parseStatus;
+      return status === "PARSING" || status === "PENDING" ? 3000 : false;
+    },
   });
 
   if (candidateLoading) return <div className="text-slate-500">Loading…</div>;
@@ -251,6 +295,15 @@ export default function CandidateDetail() {
           <h2 className="section-title">Resume</h2>
           <div className="flex items-center gap-3">
             {resume && <span className={RESUME_BADGE[resume.parseStatus]}>{resume.parseStatus}</span>}
+            {resume?.parseStatus === "PARSED" && resume.parserVersion && (() => {
+              const { text, isAi } = parserLabel(resume.parserVersion);
+              return (
+                <span className={isAi ? "badge-brand" : "badge-slate"} title={resume.parserVersion}>
+                  {isAi && <Sparkles className="h-3 w-3" />}
+                  {text}
+                </span>
+              );
+            })()}
             {isManager && (
               <button onClick={() => setShowUpload((v) => !v)} className="link-muted font-medium">
                 {resume ? "Upload new" : "Upload resume"}
@@ -268,35 +321,74 @@ export default function CandidateDetail() {
           />
         )}
         {!resume && !showUpload && <p className="mt-2 text-sm text-slate-400">No resume on file yet.</p>}
-        {resume && (
-          <>
-          {resume.parsedProfile && (
-            <div className="mt-3 space-y-3 text-sm">
-              {!!resume.parsedProfile.skills?.length && (
-                <div>
-                  <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Skills</p>
-                  <p className="mt-0.5 text-slate-700">{resume.parsedProfile.skills.join(", ")}</p>
-                </div>
-              )}
-              {!!resume.parsedProfile.experience?.length && (
-                <div>
-                  <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Experience</p>
+        {resume?.parseStatus === "FAILED" && (
+          <p className="mt-2 text-sm text-red-600">
+            Couldn't parse this resume{resume.parseError ? `: ${resume.parseError}` : "."} Try uploading it again, or check the original file.
+          </p>
+        )}
+        {resume?.parsedProfile && (
+          <div className="mt-3 space-y-4 text-sm">
+            {resume.parsedProfile.summary && (
+              <p className="text-slate-700">{resume.parsedProfile.summary}</p>
+            )}
+            {!!resume.parsedProfile.skills?.length && (
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Skills</p>
+                <p className="mt-0.5 text-slate-700">{resume.parsedProfile.skills.join(", ")}</p>
+              </div>
+            )}
+            {!!resume.parsedProfile.experience?.length && (
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Experience</p>
+                <div className="mt-1 space-y-2">
                   {resume.parsedProfile.experience.map((exp, i) => (
-                    <p key={i} className="text-slate-700">{[exp.title, exp.employer].filter(Boolean).join(" @ ")}</p>
+                    <div key={i}>
+                      <div className="flex items-baseline justify-between gap-3">
+                        <p className="font-medium text-slate-800">{[exp.title, exp.employer].filter(Boolean).join(" — ")}</p>
+                        {exp.dates && <p className="shrink-0 text-xs text-slate-400">{exp.dates}</p>}
+                      </div>
+                      {exp.description && <p className="text-slate-600">{exp.description}</p>}
+                    </div>
                   ))}
                 </div>
-              )}
-              {!!resume.parsedProfile.education?.length && (
-                <div>
-                  <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Education</p>
+              </div>
+            )}
+            {!!resume.parsedProfile.projects?.length && (
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Projects</p>
+                <div className="mt-1 space-y-2">
+                  {resume.parsedProfile.projects.map((proj, i) => (
+                    <div key={i}>
+                      <p className="font-medium text-slate-800">
+                        {proj.name}
+                        {proj.link && (
+                          <a href={proj.link} target="_blank" rel="noreferrer" className="ml-2 text-xs font-normal link-muted">
+                            View
+                          </a>
+                        )}
+                      </p>
+                      {proj.description && <p className="text-slate-600">{proj.description}</p>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {!!resume.parsedProfile.education?.length && (
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Education</p>
+                <div className="mt-1 space-y-1">
                   {resume.parsedProfile.education.map((ed, i) => (
-                    <p key={i} className="text-slate-700">{[ed.degree, ed.school].filter(Boolean).join(" — ")}</p>
+                    <div key={i} className="flex items-baseline justify-between gap-3">
+                      <p className="text-slate-700">
+                        {[[ed.degree, ed.field].filter(Boolean).join(", "), ed.school].filter(Boolean).join(" — ")}
+                      </p>
+                      {ed.dates && <p className="shrink-0 text-xs text-slate-400">{ed.dates}</p>}
+                    </div>
                   ))}
                 </div>
-              )}
-            </div>
-          )}
-          </>
+              </div>
+            )}
+          </div>
         )}
       </div>
 

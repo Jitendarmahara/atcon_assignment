@@ -50,8 +50,8 @@ export default function Landing() {
           <Link to="/login" className="btn-primary btn-md shadow-glow">
             Recruiter login
           </Link>
-          <Link to="/public/acme-recruiting" className="btn-secondary btn-md">
-            View demo careers site
+          <Link to="/candidate/login" className="btn-secondary btn-md">
+            Browse jobs & track applications
           </Link>
         </div>
 

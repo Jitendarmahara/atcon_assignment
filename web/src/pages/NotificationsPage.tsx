@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bell, GitCommitHorizontal, ScanSearch, UserPlus } from "lucide-react";
+import { Bell, GitCommitHorizontal, ScanSearch, UserPlus, X } from "lucide-react";
 import { api } from "../lib/api";
 import type { Notification, Page } from "../lib/types";
 
@@ -32,10 +32,25 @@ function iconFor(type: string) {
 
 export default function NotificationsPage() {
   const queryClient = useQueryClient();
-  const { data } = useQuery({ queryKey: ["notifications", "all"], queryFn: () => api.get<Page<Notification>>("/notifications?limit=50") });
+  const { data } = useQuery({
+    queryKey: ["notifications", "all"],
+    queryFn: () => api.get<Page<Notification>>("/notifications?limit=50"),
+    // useRealtime() invalidates ["notifications"] (covering this query too)
+    // the moment a notification.created event arrives - this interval is
+    // just the same reconciliation safety net every other live-updated
+    // query in this app keeps, in case a push was ever missed.
+    refetchInterval: 120_000,
+  });
 
   const markRead = useMutation({
     mutationFn: (id: string) => api.post(`/notifications/${id}/read`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["notifications"] });
+    },
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: string) => api.delete(`/notifications/${id}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["notifications"] });
     },
@@ -65,6 +80,14 @@ export default function NotificationsPage() {
                   Mark read
                 </button>
               )}
+              <button
+                onClick={() => remove.mutate(n.id)}
+                disabled={remove.isPending}
+                title="Remove"
+                className="shrink-0 rounded-lg p-1.5 text-slate-300 transition-colors hover:bg-slate-100 hover:text-slate-600"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
             </div>
           );
         })}

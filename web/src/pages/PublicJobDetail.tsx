@@ -85,6 +85,9 @@ export default function PublicJobDetail() {
               <p className="mt-1.5 text-sm text-slate-500">
                 We'll parse your resume and be in touch soon. Check your email for a confirmation.
               </p>
+              <Link to="/candidate/register" className="btn-secondary btn-sm mt-4 inline-flex">
+                Create an account to track your status
+              </Link>
             </div>
           ) : (
             <form onSubmit={onSubmit} className="space-y-4">

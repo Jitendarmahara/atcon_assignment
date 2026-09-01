@@ -71,7 +71,16 @@ const STATUS_BADGE: Record<Interview["status"], string> = {
 
 export default function Interviews() {
   const queryClient = useQueryClient();
-  const { data } = useQuery({ queryKey: ["interviews"], queryFn: () => api.get<Page<Interview>>("/interviews?limit=50") });
+  const { data } = useQuery({
+    queryKey: ["interviews"],
+    queryFn: () => api.get<Page<Interview>>("/interviews?limit=50"),
+    // useRealtime() invalidates this on interview.scheduled/interview.updated
+    // - this interval is the same reconciliation safety net every other
+    // live-updated list in this app keeps, in case a push was ever missed.
+    // Previously absent entirely, which combined with the missing push
+    // (fixed alongside this) meant the page had no update mechanism at all.
+    refetchInterval: 120_000,
+  });
   const [openScorecard, setOpenScorecard] = useState<string | null>(null);
 
   const cancel = useMutation({

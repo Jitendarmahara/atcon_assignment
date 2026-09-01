@@ -100,7 +100,27 @@ export default function JobDetail() {
       reason = window.prompt("Reason for rejecting this candidate?") ?? undefined;
       if (!reason) return;
     }
-    transition.mutate({ applicationId, toStageId: stage.id, reason });
+    transition.mutate(
+      { applicationId, toStageId: stage.id, reason },
+      {
+        // Reaching an INTERVIEW-kind stage and having an actual Interview
+        // record scheduled are two separate things in this system - the
+        // stage move alone puts nothing on the Interviews page, since
+        // scheduling needs a real date/panelists a drag-and-drop can't
+        // supply. Previously that gap was silent: nothing prompted for the
+        // second step, so a candidate could sit in "Interview" indefinitely
+        // with nothing to actually interview them against. This closes it
+        // in one extra click instead of requiring a recruiter to remember
+        // to separately visit the candidate's page.
+        onSuccess: () => {
+          if (stage.kind !== "INTERVIEW") return;
+          const wantsToSchedule = window.confirm(
+            `${app.candidate?.fullName ?? "This candidate"} is now in ${stage.name}. Schedule their interview now?`,
+          );
+          if (wantsToSchedule) navigate(`/app/candidates/${app.candidateId}?scheduleFor=${applicationId}`);
+        },
+      },
+    );
   }
 
   return (

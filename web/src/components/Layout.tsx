@@ -4,7 +4,7 @@ import { Bell, Briefcase, Copy, LayoutDashboard, LayoutGrid, LogOut, UserSearch,
 import { useAuth } from "../hooks/useAuth";
 import { useRealtime } from "../hooks/useRealtime";
 import { api } from "../lib/api";
-import { canManage, type Notification, type Page } from "../lib/types";
+import { canManage } from "../lib/types";
 
 const navItems = [
   { to: "/app/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -23,9 +23,13 @@ export default function Layout() {
   useRealtime(!!user);
   const visibleNavItems = navItems.filter((item) => !item.managersOnly || canManage(user?.role));
 
-  const { data: notifications } = useQuery({
+  // A dedicated COUNT(*), not items.length off a limited list - the bell's
+  // whole job is showing an accurate number, and a `limit`-capped list
+  // freezes the badge the moment unread count exceeds that limit (see
+  // notifications/service.ts:getUnreadCount).
+  const { data: unreadCountData } = useQuery({
     queryKey: ["notifications", "unread"],
-    queryFn: () => api.get<Page<Notification>>("/notifications?unreadOnly=true&limit=10"),
+    queryFn: () => api.get<{ count: number }>("/notifications/unread-count"),
     // A reconciliation safety net, not the primary update path anymore -
     // useRealtime() above invalidates this the moment a notification.created
     // event arrives. Kept at a long interval in case a push was ever missed
@@ -33,7 +37,7 @@ export default function Layout() {
     // push alone to never lose one.
     refetchInterval: 120_000,
   });
-  const unreadCount = notifications?.items.length ?? 0;
+  const unreadCount = unreadCountData?.count ?? 0;
 
   const initials = (user?.name ?? "?")
     .split(" ")

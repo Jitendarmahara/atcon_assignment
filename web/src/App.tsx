@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
 import ProtectedRoute from "./components/ProtectedRoute";
+import CandidateProtectedRoute from "./components/CandidateProtectedRoute";
 import Landing from "./pages/Landing";
 import Login from "./pages/Login";
 import PublicJobs from "./pages/PublicJobs";
@@ -13,6 +14,11 @@ import CandidateDetail from "./pages/CandidateDetail";
 import Duplicates from "./pages/Duplicates";
 import Interviews from "./pages/Interviews";
 import NotificationsPage from "./pages/NotificationsPage";
+import CandidateLogin from "./pages/CandidateLogin";
+import CandidateRegister from "./pages/CandidateRegister";
+import CandidateForgotPassword from "./pages/CandidateForgotPassword";
+import CandidateResetPassword from "./pages/CandidateResetPassword";
+import CandidateDashboard from "./pages/CandidateDashboard";
 
 export default function App() {
   return (
@@ -21,6 +27,19 @@ export default function App() {
       <Route path="/login" element={<Login />} />
       <Route path="/public/:orgSlug" element={<PublicJobs />} />
       <Route path="/public/:orgSlug/:jobSlug" element={<PublicJobDetail />} />
+
+      <Route path="/candidate/login" element={<CandidateLogin />} />
+      <Route path="/candidate/register" element={<CandidateRegister />} />
+      <Route path="/candidate/forgot-password" element={<CandidateForgotPassword />} />
+      <Route path="/candidate/reset-password" element={<CandidateResetPassword />} />
+      <Route
+        path="/candidate/dashboard"
+        element={
+          <CandidateProtectedRoute>
+            <CandidateDashboard />
+          </CandidateProtectedRoute>
+        }
+      />
 
       <Route
         path="/app"

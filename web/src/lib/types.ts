@@ -70,10 +70,15 @@ export interface Resume {
   candidateId: string;
   originalName: string;
   parseStatus: "PENDING" | "PARSING" | "PARSED" | "FAILED";
+  parseError?: string | null;
   parsedProfile: {
+    summary?: string;
     skills?: string[];
-    experience?: Array<{ employer?: string; title?: string; description?: string }>;
-    education?: Array<{ school?: string; degree?: string }>;
+    experience?: Array<{ employer?: string; title?: string; dates?: string; description?: string }>;
+    // Personal/side projects - deliberately a separate field from
+    // experience, not a subset of it. See core/domain/resume/types.ts.
+    projects?: Array<{ name?: string; description?: string; link?: string }>;
+    education?: Array<{ school?: string; degree?: string; field?: string; dates?: string }>;
   } | null;
   parserVersion: string | null;
   createdAt: string;

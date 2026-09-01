@@ -45,8 +45,25 @@ export function useRealtime(enabled: boolean) {
       source.addEventListener("application.created", handleApplicationEvent);
       source.addEventListener("application.stage_changed", handleApplicationEvent);
       source.addEventListener("notification.created", () => {
-        queryClient.invalidateQueries({ queryKey: ["notifications", "unread"] });
+        // The shorter prefix, not just ["notifications", "unread"] - that
+        // only ever refreshed the bell's own count query. NotificationsPage
+        // uses ["notifications", "all"], a sibling key TanStack Query's
+        // prefix-match invalidation doesn't reach unless the invalidated key
+        // is a genuine prefix of it - so the notifications *page* never
+        // picked up a live push and just sat there until you left and came
+        // back. This one key invalidates every notifications-* query.
+        queryClient.invalidateQueries({ queryKey: ["notifications"] });
       });
+      // Scheduling/cancelling an interview, or completing one via a
+      // scorecard, previously published nothing here at all - the Interviews
+      // page had no push *and* no refetchInterval, so it was genuinely
+      // static, not just slow. Both event types just mean "something about
+      // this org's interviews changed" - the query is cheap enough (one org,
+      // capped at 50) that a full invalidate is simpler than diffing which
+      // interview changed.
+      const invalidateInterviews = () => queryClient.invalidateQueries({ queryKey: ["interviews"] });
+      source.addEventListener("interview.scheduled", invalidateInterviews);
+      source.addEventListener("interview.updated", invalidateInterviews);
 
       reconnectTimer = setTimeout(() => {
         source?.close();
