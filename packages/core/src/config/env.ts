@@ -30,9 +30,10 @@ const envSchema = z.object({
 
   WEB_ORIGIN: z.string().default("http://localhost:5173"),
 
-  // Both optional, both strict enhancements over the offline heuristic
-  // structurer (domain/resume/index.ts falls back to it on any failure).
-  // DEEPSEEK_API_KEY is checked first when both happen to be set.
+  // Both optional at the env-schema level (so the app can boot without
+  // either), but resume parsing itself requires one - see
+  // domain/resume/index.ts. DEEPSEEK_API_KEY is checked first when both
+  // happen to be set.
   ANTHROPIC_API_KEY: z.string().optional(),
   DEEPSEEK_API_KEY: z.string().optional(),
 });

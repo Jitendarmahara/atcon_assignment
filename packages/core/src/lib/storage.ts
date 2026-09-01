@@ -1,7 +1,24 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { env } from "../config/env.js";
+
+// A relative STORAGE_DIR ("./storage/resumes", the .env default) can't be
+// resolved against process.cwd() here: the API (server/) and every worker
+// (workers/) are separate packages with separate cwds when their dev/start
+// scripts run, so each would resolve a *different* physical directory and
+// the worker that parses a resume would never find the file the API just
+// wrote - caught exactly this running the two as genuinely separate
+// processes for the first time. Anchoring to this file's own compiled
+// location instead (packages/core/dist/lib/ -> repo root, 4 levels up)
+// resolves identically no matter which package's process is running it. An
+// absolute STORAGE_DIR is left untouched.
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
+
+function resolveStorageDir(dir: string): string {
+  return path.isAbsolute(dir) ? dir : path.resolve(REPO_ROOT, dir);
+}
 
 // Local-disk implementation of a storage boundary. Swapping to S3/GCS later
 // means writing one file that implements this interface - nothing else in
@@ -37,4 +54,4 @@ class LocalDiskStorage implements StorageAdapter {
   }
 }
 
-export const storage: StorageAdapter = new LocalDiskStorage(env.STORAGE_DIR);
+export const storage: StorageAdapter = new LocalDiskStorage(resolveStorageDir(env.STORAGE_DIR));
