@@ -1,9 +1,9 @@
-import { env } from "./config/env.js";
+import { env } from "core/config/env.js";
 import { createApp } from "./app.js";
-import { logger } from "./lib/logger.js";
-import { disconnectPrisma } from "./lib/prisma.js";
-import { closePubSub } from "./lib/pubsub.js";
-import { markShuttingDown } from "./lib/shutdownState.js";
+import { logger } from "core/lib/logger.js";
+import { disconnectPrisma } from "core/lib/prisma.js";
+import { closePubSub } from "core/lib/pubsub.js";
+import { markShuttingDown } from "core/lib/shutdownState.js";
 import { closeAllStreams } from "./modules/realtime/stream.js";
 
 // Give in-flight requests a chance to finish before the process is killed

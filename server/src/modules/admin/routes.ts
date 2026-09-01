@@ -1,8 +1,8 @@
 import { Router } from "express";
-import { asyncHandler } from "../../lib/asyncHandler.js";
+import { asyncHandler } from "core/lib/asyncHandler.js";
 import { requireAuth, requireRole } from "../../middleware/requireAuth.js";
-import { ApiError } from "../../lib/errors.js";
-import { getQueueStatus } from "./service.js";
+import { ApiError } from "core/lib/errors.js";
+import { getQueueStatus } from "core/modules/admin/service.js";
 
 export const adminRouter = Router();
 

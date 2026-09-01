@@ -1,5 +1,5 @@
 import type { Request, Response } from "express";
-import * as publicService from "./service.js";
+import * as publicService from "core/modules/public/service.js";
 import { applySchema } from "./schema.js";
 
 export async function listJobsHandler(req: Request, res: Response) {

@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
-import { ApiError } from "../../lib/errors.js";
-import * as analyticsService from "./service.js";
+import { ApiError } from "core/lib/errors.js";
+import * as analyticsService from "core/modules/analytics/service.js";
 
 function auth(req: Request) {
   if (!req.auth) throw ApiError.unauthorized();

@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
-import * as authService from "./service.js";
+import * as authService from "core/modules/auth/service.js";
 import { inviteUserSchema, loginSchema, refreshSchema, registerSchema } from "./schema.js";
-import { ApiError } from "../../lib/errors.js";
+import { ApiError } from "core/lib/errors.js";
 
 export async function registerHandler(req: Request, res: Response) {
   const input = registerSchema.parse(req.body);

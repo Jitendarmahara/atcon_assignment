@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
-import { verifyAccessToken } from "../../lib/jwt.js";
-import { subscribeOrgEvents } from "../../lib/pubsub.js";
+import { verifyAccessToken } from "core/lib/jwt.js";
+import { subscribeOrgEvents } from "core/lib/pubsub.js";
 
 const HEARTBEAT_MS = 25_000;
 

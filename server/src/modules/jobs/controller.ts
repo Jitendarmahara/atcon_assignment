@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
-import { ApiError } from "../../lib/errors.js";
-import * as jobsService from "./service.js";
+import { ApiError } from "core/lib/errors.js";
+import * as jobsService from "core/modules/jobs/service.js";
 import {
   createJobSchema,
   createStageSchema,

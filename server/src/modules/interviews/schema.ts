@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { paginationSchema } from "../../lib/pagination.js";
+import { paginationSchema } from "core/lib/pagination.js";
 
 export const createInterviewSchema = z.object({
   applicationId: z.string().uuid(),

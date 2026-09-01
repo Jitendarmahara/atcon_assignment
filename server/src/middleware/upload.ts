@@ -1,5 +1,6 @@
 import multer from "multer";
-import { env } from "../config/env.js";
+import { env } from "core/config/env.js";
+import { ApiError } from "core/lib/errors.js";
 
 const ALLOWED_MIME_TYPES = new Set([
   "application/pdf",
@@ -13,7 +14,11 @@ export const resumeUpload = multer({
   limits: { fileSize: env.MAX_UPLOAD_MB * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
-      cb(new Error("Only PDF and DOCX resumes are accepted"));
+      // Must be an ApiError, not a plain Error - errorHandler.ts only
+      // special-cases ApiError/ZodError/known Prisma codes, so a plain Error
+      // thrown here previously fell through to a raw 500 instead of the
+      // "clear error" ASSUMPTIONS.md documents for a rejected upload.
+      cb(ApiError.badRequest("Only PDF and DOCX resumes are accepted"));
       return;
     }
     cb(null, true);

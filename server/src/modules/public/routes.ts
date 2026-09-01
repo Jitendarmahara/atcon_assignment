@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { asyncHandler } from "../../lib/asyncHandler.js";
+import { asyncHandler } from "core/lib/asyncHandler.js";
 import { rateLimit } from "../../middleware/rateLimit.js";
 import { resumeUpload } from "../../middleware/upload.js";
 import * as controller from "./controller.js";

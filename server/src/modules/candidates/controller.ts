@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
-import { ApiError } from "../../lib/errors.js";
-import * as candidatesService from "./service.js";
+import { ApiError } from "core/lib/errors.js";
+import * as candidatesService from "core/modules/candidates/service.js";
 import { createCandidateSchema, listCandidatesQuerySchema, mergeCandidateSchema, updateCandidateSchema } from "./schema.js";
 
 function auth(req: Request) {

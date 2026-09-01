@@ -5,11 +5,11 @@ import compression from "compression";
 import swaggerUi from "swagger-ui-express";
 // Named import for the same reason as ioredis - see lib/redis.ts.
 import { pinoHttp } from "pino-http";
-import { env } from "./config/env.js";
-import { logger } from "./lib/logger.js";
-import { prisma } from "./lib/prisma.js";
-import { redis } from "./lib/redis.js";
-import { isShuttingDown } from "./lib/shutdownState.js";
+import { env } from "core/config/env.js";
+import { logger } from "core/lib/logger.js";
+import { prisma } from "core/lib/prisma.js";
+import { redis } from "core/lib/redis.js";
+import { isShuttingDown } from "core/lib/shutdownState.js";
 import { requestId } from "./middleware/requestId.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import { authRouter } from "./modules/auth/routes.js";
@@ -22,6 +22,8 @@ import { notificationsRouter } from "./modules/notifications/routes.js";
 import { analyticsRouter } from "./modules/analytics/routes.js";
 import { adminRouter } from "./modules/admin/routes.js";
 import { publicRouter } from "./modules/public/routes.js";
+import { candidateAuthRouter } from "./modules/candidateAuth/routes.js";
+import { candidatePortalRouter } from "./modules/candidatePortal/routes.js";
 import { realtimeStreamHandler } from "./modules/realtime/stream.js";
 import { openApiDocument } from "./openapi.js";
 
@@ -90,6 +92,8 @@ export function createApp() {
   api.use("/analytics", analyticsRouter);
   api.use("/admin", adminRouter);
   api.use("/public", publicRouter);
+  api.use("/candidate-auth", candidateAuthRouter);
+  api.use("/candidate-portal", candidatePortalRouter);
   // Its own auth (token as a query param, not a header - see stream.ts) since
   // it's opened by the browser's native EventSource, which can't set headers.
   api.get("/realtime/stream", realtimeStreamHandler);

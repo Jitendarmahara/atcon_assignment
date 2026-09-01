@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import type { UserRole } from "@prisma/client";
-import { verifyAccessToken } from "../lib/jwt.js";
-import { ApiError } from "../lib/errors.js";
+import { verifyAccessToken } from "core/lib/jwt.js";
+import { ApiError } from "core/lib/errors.js";
 
 export interface AuthContext {
   userId: string;

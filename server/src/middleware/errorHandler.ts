@@ -1,8 +1,9 @@
 import type { NextFunction, Request, Response } from "express";
 import { ZodError } from "zod";
 import { Prisma } from "@prisma/client";
-import { ApiError } from "../lib/errors.js";
-import { logger } from "../lib/logger.js";
+import { MulterError } from "multer";
+import { ApiError } from "core/lib/errors.js";
+import { logger } from "core/lib/logger.js";
 
 // Uniform RFC 7807 (application/problem+json) error body across the whole API.
 export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction) {
@@ -61,6 +62,23 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
         requestId: req.requestId,
       });
     }
+  }
+
+  // Multer's own errors (e.g. LIMIT_FILE_SIZE when a resume exceeds
+  // MAX_UPLOAD_MB) are plain Errors from multer's perspective, not ApiError -
+  // without this they fell through to the generic 500 below, contradicting
+  // the "rejected at the upload boundary with a clear error" behavior
+  // ASSUMPTIONS.md documents for oversized/wrong-type uploads.
+  if (err instanceof MulterError) {
+    const detail = err.code === "LIMIT_FILE_SIZE" ? "Resume file is too large" : err.message;
+    return res.status(400).type("application/problem+json").json({
+      type: "bad-request",
+      title: "bad-request",
+      status: 400,
+      detail,
+      instance: req.originalUrl,
+      requestId: req.requestId,
+    });
   }
 
   logger.error({ err, requestId: req.requestId }, "unhandled error");

@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
-import { ApiError } from "../../lib/errors.js";
-import * as applicationsService from "./service.js";
+import { ApiError } from "core/lib/errors.js";
+import * as applicationsService from "core/modules/applications/service.js";
 import { createApplicationSchema, listApplicationsQuerySchema, transitionApplicationSchema } from "./schema.js";
 
 function auth(req: Request) {

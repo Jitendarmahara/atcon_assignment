@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
-import { ApiError } from "../../lib/errors.js";
-import { paginationSchema } from "../../lib/pagination.js";
-import * as duplicatesService from "./service.js";
+import { ApiError } from "core/lib/errors.js";
+import { paginationSchema } from "core/lib/pagination.js";
+import * as duplicatesService from "core/modules/duplicates/service.js";
 
 function auth(req: Request) {
   if (!req.auth) throw ApiError.unauthorized();

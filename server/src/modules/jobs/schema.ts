@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { paginationSchema } from "../../lib/pagination.js";
+import { paginationSchema } from "core/lib/pagination.js";
 
 export const employmentTypeEnum = z.enum(["FULL_TIME", "PART_TIME", "CONTRACT", "INTERNSHIP"]);
 export const jobStatusEnum = z.enum(["DRAFT", "PUBLISHED", "CLOSED"]);
