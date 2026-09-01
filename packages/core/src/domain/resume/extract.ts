@@ -38,10 +38,36 @@ async function extractDocxText(buffer: Buffer): Promise<string> {
   return result.value;
 }
 
+// Some resume-builder export pipelines embed the entire resume's text twice
+// in one file - a visibly-rendered layer plus a duplicate (often an
+// "ATS-friendly" hidden text layer some tools add deliberately). pdf.js (and
+// in principle a similarly-built DOCX) extracts every text-showing operator
+// regardless of which layer it belongs to, so the duplication carries
+// straight into the raw string. An LLM structurer tends to silently self-heal
+// this - it recognizes the content as the same thing twice - but the offline
+// heuristic structurer has no semantic understanding and faithfully doubles
+// every section (verified against a real resume that hit exactly this:
+// every skill, job, and bullet appeared twice in the parsed output).
+// Detected by checking whether the document's own opening line reappears
+// later in the text - a short line is never trusted as the signal (too easy
+// to coincidentally repeat), but a resume's first line is almost always the
+// candidate's full name, long and specific enough that a verbatim repeat is
+// overwhelmingly more likely to be a duplicated layer than a coincidence.
+export function dropRepeatedContent(text: string): string {
+  const firstLineEnd = text.indexOf("\n");
+  const firstLine = (firstLineEnd === -1 ? text : text.slice(0, firstLineEnd)).trim();
+  if (firstLine.length < 8) return text;
+
+  const repeatIndex = text.indexOf(firstLine, firstLine.length);
+  if (repeatIndex === -1) return text;
+
+  return text.slice(0, repeatIndex).trim();
+}
+
 export async function extractResumeText(buffer: Buffer, mimeType: string): Promise<string> {
-  if (mimeType === "application/pdf") return extractPdfText(buffer);
+  if (mimeType === "application/pdf") return dropRepeatedContent(await extractPdfText(buffer));
   if (mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-    return extractDocxText(buffer);
+    return dropRepeatedContent(await extractDocxText(buffer));
   }
   throw new Error(`Unsupported resume mime type: ${mimeType}`);
 }

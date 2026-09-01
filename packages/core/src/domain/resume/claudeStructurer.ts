@@ -12,9 +12,14 @@ const EXTRACT_TOOL = {
       name: { type: "string" },
       email: { type: "string" },
       phone: { type: "string" },
+      summary: {
+        type: "string",
+        description: "The resume's own professional summary/objective, if it has one. Omit if there isn't one - do not invent one.",
+      },
       skills: { type: "array", items: { type: "string" } },
       experience: {
         type: "array",
+        description: "Paid, professional employment only. Personal or side projects go in `projects`, even if the resume lists them under a similar-looking header.",
         items: {
           type: "object",
           properties: {
@@ -22,6 +27,19 @@ const EXTRACT_TOOL = {
             title: { type: "string" },
             dates: { type: "string" },
             description: { type: "string" },
+          },
+        },
+      },
+      projects: {
+        type: "array",
+        description:
+          "Personal, side, or portfolio projects - not paid employment. For each, write a clear, plain-language description of what it actually does, in a full sentence a recruiter with no context could understand - never just the project's own name or tagline copied verbatim if that alone wouldn't explain it.",
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string" },
+            description: { type: "string" },
+            link: { type: "string" },
           },
         },
       },
@@ -38,7 +56,7 @@ const EXTRACT_TOOL = {
         },
       },
     },
-    required: ["skills", "experience", "education"],
+    required: ["skills", "experience", "projects", "education"],
   },
 };
 
@@ -59,7 +77,7 @@ export function createClaudeStructurer(apiKey: string): ResumeStructurer {
         messages: [
           {
             role: "user",
-            content: `Extract structured fields from this resume text. Only use information present in the text - do not invent employers, dates, or skills.\n\n${rawText.slice(0, 15_000)}`,
+            content: `Extract structured fields from this resume text. Only use information present in the text - do not invent employers, dates, or skills. Keep paid employment in \`experience\` and personal/side projects in \`projects\` - they are not the same thing even when a resume's own formatting makes them look similar. For each project, actually explain what it does; do not just restate its name.\n\n${rawText.slice(0, 15_000)}`,
           },
         ],
       });
@@ -74,8 +92,10 @@ export function createClaudeStructurer(apiKey: string): ResumeStructurer {
         name: input.name,
         email: input.email,
         phone: input.phone,
+        summary: input.summary,
         skills: input.skills ?? [],
         experience: input.experience ?? [],
+        projects: input.projects ?? [],
         education: input.education ?? [],
       };
     },

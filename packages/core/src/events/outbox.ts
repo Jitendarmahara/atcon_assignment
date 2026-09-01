@@ -13,6 +13,13 @@ type TxClient = Prisma.TransactionClient;
 // table can be RLS-scoped and tenant-filtered like every other table, and so
 // GET /api/v1/admin/queues's dead-letter listing can be scoped to the
 // caller's own org instead of every org's.
+//
+// Returns the created row so the caller can attempt an immediate dispatch
+// right after its transaction commits (events/relay.ts's dispatchNowBestEffort)
+// instead of only ever waiting for the relay's next poll tick - see
+// ARCHITECTURE.md's "Transactional outbox" section for why this is still
+// safe to skip/fail: the row itself is what the poll tick's backstop already
+// depends on, this is purely a latency optimization on top of it.
 export async function writeOutboxEvent(tx: TxClient, type: EventType, payload: { orgId: string } & Record<string, unknown>) {
-  await tx.outboxEvent.create({ data: { type, orgId: payload.orgId, payload: payload as never } });
+  return tx.outboxEvent.create({ data: { type, orgId: payload.orgId, payload: payload as never } });
 }

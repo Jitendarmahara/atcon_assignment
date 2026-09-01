@@ -1,5 +1,5 @@
 import { prisma } from "../../lib/prisma.js";
-import { AUTO_LINK_THRESHOLD, REVIEW_THRESHOLD, scoreDuplicate } from "./score.js";
+import { AUTO_LINK_THRESHOLD, REVIEW_THRESHOLD, scoreDuplicate, type DedupeSignal } from "./score.js";
 
 // Ordering convention so a pair only ever gets one link row regardless of
 // which candidate triggered the scan (matches the (candidateAId, candidateBId)
@@ -8,9 +8,28 @@ function orderedPair(a: string, b: string): [string, string] {
   return a < b ? [a, b] : [b, a];
 }
 
-async function upsertLink(orgId: string, aId: string, bId: string, confidence: number, signals: unknown) {
+// scanFullDuplicatesForCandidate calls this up to three times per pair (exact
+// match, resume hash, fuzzy name), each with only its own single signal -
+// score.ts's "max, not sum" logic only applies within one of those calls. Merge
+// by signal name so a later, weaker call can't clobber an earlier, stronger one.
+function mergeSignals(existing: DedupeSignal[], incoming: DedupeSignal[]): DedupeSignal[] {
+  const byName = new Map(existing.map((s) => [s.name, s]));
+  for (const s of incoming) byName.set(s.name, s);
+  return [...byName.values()];
+}
+
+async function upsertLink(orgId: string, aId: string, bId: string, confidence: number, signals: DedupeSignal[]) {
   const [candidateAId, candidateBId] = orderedPair(aId, bId);
-  const status = confidence >= AUTO_LINK_THRESHOLD ? "CONFIRMED" : "PENDING";
+
+  // Not atomic (read then upsert) - acceptable here since dedupe scans for a
+  // given candidate run one at a time from the BullMQ queue, not concurrently;
+  // a race would at worst drop one signal from the merge, never corrupt data.
+  const existing = await prisma.duplicateCandidateLink.findUnique({
+    where: { candidateAId_candidateBId: { candidateAId, candidateBId } },
+  });
+  const finalSignals = mergeSignals((existing?.signals as unknown as DedupeSignal[] | undefined) ?? [], signals);
+  const finalConfidence = Math.max(existing?.confidence ?? 0, confidence);
+  const shouldConfirm = finalConfidence >= AUTO_LINK_THRESHOLD;
 
   // Auto-linking (>=0.9) marks the link CONFIRMED automatically since the
   // signal is essentially unambiguous (exact email/phone/resume hash) - but
@@ -19,8 +38,18 @@ async function upsertLink(orgId: string, aId: string, bId: string, confidence: n
   // when confidence is high, so a recruiter always sees what changed.
   await prisma.duplicateCandidateLink.upsert({
     where: { candidateAId_candidateBId: { candidateAId, candidateBId } },
-    create: { candidateAId, candidateBId, confidence, signals: signals as never, status },
-    update: { confidence, signals: signals as never, ...(status === "CONFIRMED" ? { status } : {}) },
+    create: {
+      candidateAId,
+      candidateBId,
+      confidence: finalConfidence,
+      signals: finalSignals as never,
+      status: shouldConfirm ? "CONFIRMED" : "PENDING",
+    },
+    update: {
+      confidence: finalConfidence,
+      signals: finalSignals as never,
+      ...(shouldConfirm ? { status: "CONFIRMED" } : {}),
+    },
   });
 
   void orgId; // reserved: org is implied by candidate scoping upstream, kept for future cross-org guard

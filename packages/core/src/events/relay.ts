@@ -7,9 +7,18 @@ import type {
   InterviewScheduledPayload,
   ResumeUploadedPayload,
 } from "./types.js";
-import { emailSendQueue, interviewReminderQueue, resumeParseQueue } from "../queues/definitions.js";
+import { notificationsQueue, resumeParseQueue } from "../queues/definitions.js";
 
-const POLL_INTERVAL_MS = 1000;
+// This is now a backstop, not the primary dispatch path - see
+// dispatchNowBestEffort() below, called directly from the write path right
+// after each transaction that writes an outbox row commits. A tick only
+// needs to catch whatever that fast path missed (a crash, a Redis blip, a
+// dispatch that failed silently) - see ARCHITECTURE.md's "Transactional
+// outbox" section for the reasoning on why 5 minutes is safe here: the
+// durability guarantee never depended on the poll interval, only on the row
+// existing in Postgres, so slowing this down changes worst-case latency for
+// a missed fast-path attempt, never correctness.
+const POLL_INTERVAL_MS = 5 * 60 * 1000;
 const BATCH_SIZE = 20;
 const MAX_ATTEMPTS = 8;
 // How long a row can sit PROCESSING before another tick is allowed to
@@ -30,14 +39,17 @@ interface OutboxRow {
 // jobId is derived from the outbox row id so a relay crash-and-restart
 // between "enqueue succeeded" and "mark SENT" produces a duplicate add()
 // call that BullMQ simply dedupes, instead of a duplicate email/parse job.
-async function dispatch(event: OutboxRow) {
+// That same idempotency is exactly what makes it safe for both
+// dispatchNowBestEffort() (the fast path, below) and a poll tick to
+// occasionally both attempt this for the same row - never a duplicate job.
+export async function dispatch(event: OutboxRow) {
   switch (event.type) {
     case EVENT_TYPES.RESUME_UPLOADED: {
       await resumeParseQueue.add("parse", event.payload as ResumeUploadedPayload, { jobId: `resume-parse-${event.id}` });
       return;
     }
     case EVENT_TYPES.APPLICATION_SUBMITTED: {
-      await emailSendQueue.add("application-confirmation", event.payload as ApplicationSubmittedPayload, {
+      await notificationsQueue.add("application-confirmation", event.payload as ApplicationSubmittedPayload, {
         jobId: `app-confirm-${event.id}`,
       });
       return;
@@ -46,17 +58,17 @@ async function dispatch(event: OutboxRow) {
       const payload = event.payload as ApplicationStageChangedPayload;
       // Only HIRED/REJECTED are candidate-facing emails; every stage change
       // still produces an in-app notification (handled inside the processor).
-      await emailSendQueue.add("stage-changed-notify", payload, { jobId: `stage-notify-${event.id}` });
+      await notificationsQueue.add("stage-changed-notify", payload, { jobId: `stage-notify-${event.id}` });
       return;
     }
     case EVENT_TYPES.INTERVIEW_SCHEDULED: {
       const payload = event.payload as InterviewScheduledPayload;
-      await emailSendQueue.add("interview-invite", payload, { jobId: `interview-invite-${event.id}` });
+      await notificationsQueue.add("interview-invite", payload, { jobId: `interview-invite-${event.id}` });
 
       const interview = await prisma.interview.findUnique({ where: { id: payload.interviewId } });
       if (interview) {
         const delay = Math.max(0, interview.scheduledAt.getTime() - 24 * 60 * 60 * 1000 - Date.now());
-        await interviewReminderQueue.add(
+        await notificationsQueue.add(
           "remind",
           { interviewId: payload.interviewId },
           { delay, jobId: `interview-remind-${event.id}` },
@@ -126,6 +138,32 @@ export async function relayOnce(): Promise<number> {
   }
 
   return rows.length;
+}
+
+// The fast path: called directly from the write path (applications/,
+// interviews/, candidates/ services) right after the transaction that wrote
+// `row` commits, instead of only ever waiting for the next poll tick.
+// Deliberately fire-and-forget - the caller must never await this into its
+// response, and a failure here must never surface to the request that
+// triggered it:
+//   - On success, the row is marked SENT immediately - typically dispatched
+//     within milliseconds of the write, not up to POLL_INTERVAL_MS later.
+//   - On failure (Redis down, a crash mid-call, anything), this does nothing
+//     further - no retry/backoff bookkeeping here, because relayOnce()'s
+//     poll tick already owns that. The row is simply left PENDING, exactly
+//     as if this fast path had never been attempted at all, and the next
+//     tick's normal claim-and-retry logic picks it up from there.
+// This never introduces a duplicate job even if a poll tick's claim and this
+// fast path race on the same row (possible but very unlikely, since a
+// successful call here almost always completes long before the next tick
+// fires) - dispatch()'s deterministic jobId makes a second attempt at the
+// same event a safe no-op in BullMQ.
+export function dispatchNowBestEffort(row: OutboxRow): void {
+  dispatch(row)
+    .then(() => prisma.outboxEvent.update({ where: { id: row.id }, data: { status: "SENT" } }))
+    .catch((err) => {
+      logger.warn({ err, eventId: row.id, type: row.type }, "outbox: immediate dispatch failed, will retry on next relay tick");
+    });
 }
 
 export function startRelay(): () => void {
